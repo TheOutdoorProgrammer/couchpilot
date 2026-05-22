@@ -178,7 +178,9 @@ function bindEvents() {
 
   document.getElementById('settings-btn').addEventListener('click', () => {
     renderFavDirs();
-    document.getElementById('default-skip').checked = config.defaultSkipPermissions;
+    document.getElementById('default-perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
+    setModelSelect('default-model', 'default-model-custom', config.defaultModel || '');
+    document.getElementById('default-effort').value = config.defaultEffort || '';
     openModal('settings-modal');
   });
 
@@ -223,7 +225,9 @@ function bindEvents() {
       await createSession({
         name: form.name.value.trim(),
         dir: form.dir.value.trim() || config.defaultDir,
-        skipPerms: form.skipPerms.checked,
+        permissionMode: form.permissionMode.value,
+        model: getModelValue('session-model', 'session-model-custom'),
+        effort: form.effort.value,
       });
       closeModal('new-modal');
       form.reset();
@@ -249,7 +253,9 @@ function bindEvents() {
     try {
       await saveConfig({
         favoriteDirs: config.favoriteDirs,
-        defaultSkipPermissions: document.getElementById('default-skip').checked,
+        defaultPermissionMode: document.getElementById('default-perm-mode').value,
+        defaultModel: getModelValue('default-model', 'default-model-custom'),
+        defaultEffort: document.getElementById('default-effort').value,
       });
       closeModal('settings-modal');
       toast('Settings saved');
@@ -278,6 +284,18 @@ function bindEvents() {
     }
   });
 
+  document.getElementById('session-model').addEventListener('change', (e) => {
+    const custom = document.getElementById('session-model-custom');
+    if (e.target.value === '__custom__') { custom.style.display = ''; custom.focus(); }
+    else { custom.style.display = 'none'; custom.value = ''; }
+  });
+
+  document.getElementById('default-model').addEventListener('change', (e) => {
+    const custom = document.getElementById('default-model-custom');
+    if (e.target.value === '__custom__') { custom.style.display = ''; custom.focus(); }
+    else { custom.style.display = 'none'; custom.value = ''; }
+  });
+
   document.getElementById('confirm-yes').addEventListener('click', () => {
     closeModal('confirm-modal');
     if (confirmCallback) confirmCallback();
@@ -301,7 +319,9 @@ function bindEvents() {
 function openNewModal() {
   const form = document.getElementById('new-form');
   form.reset();
-  document.getElementById('skip-perms').checked = config.defaultSkipPermissions;
+  document.getElementById('perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
+  setModelSelect('session-model', 'session-model-custom', config.defaultModel || '');
+  document.getElementById('session-effort').value = config.defaultEffort || '';
   document.getElementById('session-dir').value = '';
   renderDirChips();
   openModal('new-modal');
@@ -354,6 +374,29 @@ function shortenDir(dir) {
   const home = '/Users/' + (dir.split('/')[2] || '');
   if (dir.startsWith(home)) return '~' + dir.slice(home.length);
   return dir;
+}
+
+function setModelSelect(selectId, customId, value) {
+  const select = document.getElementById(selectId);
+  const custom = document.getElementById(customId);
+  const hasOption = Array.from(select.options).some(o => o.value === value);
+  if (value && !hasOption) {
+    select.value = '__custom__';
+    custom.value = value;
+    custom.style.display = '';
+  } else {
+    select.value = value || '';
+    custom.value = '';
+    custom.style.display = 'none';
+  }
+}
+
+function getModelValue(selectId, customId) {
+  const select = document.getElementById(selectId);
+  if (select.value === '__custom__') {
+    return document.getElementById(customId).value;
+  }
+  return select.value;
 }
 
 function esc(s) {

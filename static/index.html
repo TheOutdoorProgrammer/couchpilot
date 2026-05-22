@@ -49,12 +49,51 @@
           <div id="dir-chips" class="chips"></div>
           <input type="text" id="session-dir" name="dir" placeholder="~/" autocomplete="off">
         </div>
-        <div class="field toggle-field">
-          <span>Skip permissions</span>
-          <label class="toggle">
-            <input type="checkbox" id="skip-perms" name="skipPerms">
-            <span class="toggle-track"></span>
-          </label>
+        <div class="field">
+          <label for="perm-mode">Permission Mode</label>
+          <select id="perm-mode" name="permissionMode" class="select-field">
+            <option value="bypassPermissions">Bypass Permissions</option>
+            <option value="auto">Auto</option>
+            <option value="dontAsk">Don't Ask</option>
+            <option value="acceptEdits">Accept Edits</option>
+            <option value="plan">Plan</option>
+            <option value="default">Default</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="session-model">Model</label>
+          <select id="session-model" name="model" class="select-field">
+            <option value="">Default</option>
+            <optgroup label="Latest">
+              <option value="claude-opus-4-7">Opus 4.7</option>
+              <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+              <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            </optgroup>
+            <optgroup label="Previous">
+              <option value="claude-opus-4-6">Opus 4.6</option>
+              <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
+              <option value="claude-opus-4-5-20251101">Opus 4.5</option>
+              <option value="claude-opus-4-1-20250805">Opus 4.1</option>
+            </optgroup>
+            <optgroup label="Aliases">
+              <option value="opus">opus</option>
+              <option value="sonnet">sonnet</option>
+              <option value="haiku">haiku</option>
+            </optgroup>
+            <option value="__custom__">Custom...</option>
+          </select>
+          <input type="text" id="session-model-custom" placeholder="Enter model ID..." autocomplete="off" style="display:none;margin-top:8px;">
+        </div>
+        <div class="field">
+          <label for="session-effort">Effort</label>
+          <select id="session-effort" name="effort" class="select-field">
+            <option value="">Default</option>
+            <option value="max">Max</option>
+            <option value="xhigh">Extra High</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
         </div>
         <div class="form-actions">
           <button type="button" class="btn btn-ghost" data-dismiss="new-modal">Cancel</button>
@@ -77,12 +116,51 @@
           <button type="button" id="add-fav-btn" class="btn btn-small">Add</button>
         </div>
       </div>
-      <div class="field toggle-field">
-        <span>Default skip permissions</span>
-        <label class="toggle">
-          <input type="checkbox" id="default-skip">
-          <span class="toggle-track"></span>
-        </label>
+      <div class="field">
+        <label for="default-perm-mode">Default Permission Mode</label>
+        <select id="default-perm-mode" class="select-field">
+          <option value="bypassPermissions">Bypass Permissions</option>
+          <option value="auto">Auto</option>
+          <option value="dontAsk">Don't Ask</option>
+          <option value="acceptEdits">Accept Edits</option>
+          <option value="plan">Plan</option>
+          <option value="default">Default</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="default-model">Default Model</label>
+        <select id="default-model" class="select-field">
+          <option value="">None</option>
+          <optgroup label="Latest">
+            <option value="claude-opus-4-7">Opus 4.7</option>
+            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+          </optgroup>
+          <optgroup label="Previous">
+            <option value="claude-opus-4-6">Opus 4.6</option>
+            <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
+            <option value="claude-opus-4-5-20251101">Opus 4.5</option>
+            <option value="claude-opus-4-1-20250805">Opus 4.1</option>
+          </optgroup>
+          <optgroup label="Aliases">
+            <option value="opus">opus</option>
+            <option value="sonnet">sonnet</option>
+            <option value="haiku">haiku</option>
+          </optgroup>
+          <option value="__custom__">Custom...</option>
+        </select>
+        <input type="text" id="default-model-custom" placeholder="Enter model ID..." autocomplete="off" style="display:none;margin-top:8px;">
+      </div>
+      <div class="field">
+        <label for="default-effort">Default Effort</label>
+        <select id="default-effort" class="select-field">
+          <option value="">None</option>
+          <option value="max">Max</option>
+          <option value="xhigh">Extra High</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
       </div>
       <div class="form-actions">
         <button type="button" class="btn btn-ghost" data-dismiss="settings-modal">Close</button>

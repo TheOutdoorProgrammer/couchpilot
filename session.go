@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 type SessionStatus string
@@ -31,9 +35,9 @@ type Session struct {
 	Name      string        `json:"name"`
 	Dir       string        `json:"dir"`
 	PID       int           `json:"pid"`
-	URL       string        `json:"url"`
-	Status    SessionStatus `json:"status"`
-	SkipPerms bool          `json:"skipPerms"`
+	URL            string        `json:"url"`
+	Status         SessionStatus `json:"status"`
+	PermissionMode string        `json:"permissionMode"`
 	CreatedAt time.Time     `json:"createdAt"`
 	DiedAt    *time.Time    `json:"diedAt,omitempty"`
 
@@ -58,7 +62,7 @@ func NewSessionManager(dataDir string, hub *SSEHub) *SessionManager {
 	return sm
 }
 
-func (sm *SessionManager) CreateSession(name, dir string, skipPerms bool) (*Session, error) {
+func (sm *SessionManager) CreateSession(name, dir, permMode, model, effort string) (*Session, error) {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, err
@@ -71,40 +75,40 @@ func (sm *SessionManager) CreateSession(name, dir string, skipPerms bool) (*Sess
 		dir, _ = os.UserHomeDir()
 	}
 
-	args := []string{"remote-control", "--spawn", "session"}
-	if name != "" {
-		args = append(args, "--name", name)
+	if name == "" {
+		name = generateName()
 	}
-	if skipPerms {
+
+	args := []string{"--remote-control", name}
+	if permMode == "bypassPermissions" {
 		args = append(args, "--dangerously-skip-permissions")
+	} else if permMode != "" && permMode != "default" {
+		args = append(args, "--permission-mode", permMode)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
 	}
 
 	cmd := exec.Command(claudePath, args...)
 	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	stdout, err := cmd.StdoutPipe()
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 
 	s := &Session{
-		ID:        generateID(),
-		Name:      name,
-		Dir:       dir,
-		PID:       cmd.Process.Pid,
-		Status:    StatusStarting,
-		SkipPerms: skipPerms,
-		CreatedAt: time.Now(),
-		cmd:       cmd,
+		ID:             generateID(),
+		Name:           name,
+		Dir:            dir,
+		PID:            cmd.Process.Pid,
+		Status:         StatusStarting,
+		PermissionMode: permMode,
+		CreatedAt:      time.Now(),
+		cmd:            cmd,
 	}
 
 	sm.mu.Lock()
@@ -113,9 +117,17 @@ func (sm *SessionManager) CreateSession(name, dir string, skipPerms bool) (*Sess
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_created", Data: s})
 
-	go sm.scanOutput(s, stdout)
-	go sm.scanOutput(s, stderr)
+	go sm.scanOutput(s, ptmx)
 	go sm.waitProcess(s)
+
+	if permMode == "bypassPermissions" {
+		go func() {
+			time.Sleep(1 * time.Second)
+			ptmx.Write([]byte("\x1b[B"))
+			time.Sleep(200 * time.Millisecond)
+			ptmx.Write([]byte("\r"))
+		}()
+	}
 
 	return s, nil
 }
@@ -168,6 +180,7 @@ func (sm *SessionManager) scanOutput(s *Session, r io.Reader) {
 			continue
 		}
 
+		log.Printf("[%s] %s", s.Name, line)
 		if url := urlPattern.FindString(line); url != "" {
 			sm.mu.Lock()
 			s.URL = url
@@ -185,7 +198,8 @@ func (sm *SessionManager) waitProcess(s *Session) {
 	if s.cmd == nil {
 		return
 	}
-	s.cmd.Wait()
+	err := s.cmd.Wait()
+	log.Printf("[%s] process exited: %v", s.Name, err)
 
 	sm.mu.Lock()
 	if s.Status == StatusStarting {
@@ -303,4 +317,22 @@ var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07`)
 
 func stripANSI(s string) string {
 	return ansiPattern.ReplaceAllString(s, "")
+}
+
+var adjectives = []string{
+	"swift", "calm", "bold", "warm", "cool", "keen", "bright", "quiet",
+	"quick", "sharp", "smooth", "steady", "fresh", "gentle", "vivid",
+	"crisp", "clear", "nimble", "proud", "brave",
+}
+
+var nouns = []string{
+	"falcon", "cedar", "river", "summit", "breeze", "ember", "compass",
+	"harbor", "meadow", "canyon", "lantern", "tide", "ridge", "aurora",
+	"grove", "drift", "spark", "cove", "peak", "trail",
+}
+
+func generateName() string {
+	ai, _ := rand.Int(rand.Reader, big.NewInt(int64(len(adjectives))))
+	ni, _ := rand.Int(rand.Reader, big.NewInt(int64(len(nouns))))
+	return fmt.Sprintf("%s-%s", adjectives[ai.Int64()], nouns[ni.Int64()])
 }

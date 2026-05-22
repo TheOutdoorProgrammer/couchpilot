@@ -82,7 +82,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
 
-	return http.ListenAndServe(fmt.Sprintf("localhost:%d", s.cfg.Port), mux)
+	return http.ListenAndServe(fmt.Sprintf(":%d", s.cfg.Port), mux)
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -91,9 +91,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name      string `json:"name"`
-		Dir       string `json:"dir"`
-		SkipPerms *bool  `json:"skipPerms"`
+		Name           string `json:"name"`
+		Dir            string `json:"dir"`
+		PermissionMode string `json:"permissionMode"`
+		Model          string `json:"model"`
+		Effort         string `json:"effort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, "invalid request body", http.StatusBadRequest)
@@ -105,12 +107,22 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		dir = s.cfg.DefaultDir
 	}
 
-	skipPerms := s.cfg.DefaultSkipPermissions
-	if req.SkipPerms != nil {
-		skipPerms = *req.SkipPerms
+	permMode := req.PermissionMode
+	if permMode == "" {
+		permMode = s.cfg.DefaultPermissionMode
 	}
 
-	session, err := s.sm.CreateSession(req.Name, dir, skipPerms)
+	model := req.Model
+	if model == "" {
+		model = s.cfg.DefaultModel
+	}
+
+	effort := req.Effort
+	if effort == "" {
+		effort = s.cfg.DefaultEffort
+	}
+
+	session, err := s.sm.CreateSession(req.Name, dir, permMode, model, effort)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -174,9 +186,11 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	var incoming struct {
-		DefaultDir             *string  `json:"defaultDir"`
-		FavoriteDirs           []string `json:"favoriteDirs"`
-		DefaultSkipPermissions *bool    `json:"defaultSkipPermissions"`
+		DefaultDir            *string  `json:"defaultDir"`
+		FavoriteDirs          []string `json:"favoriteDirs"`
+		DefaultPermissionMode *string  `json:"defaultPermissionMode"`
+		DefaultModel          *string  `json:"defaultModel"`
+		DefaultEffort         *string  `json:"defaultEffort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		httpError(w, err.Error(), http.StatusBadRequest)
@@ -189,8 +203,14 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if incoming.FavoriteDirs != nil {
 		s.cfg.FavoriteDirs = incoming.FavoriteDirs
 	}
-	if incoming.DefaultSkipPermissions != nil {
-		s.cfg.DefaultSkipPermissions = *incoming.DefaultSkipPermissions
+	if incoming.DefaultPermissionMode != nil {
+		s.cfg.DefaultPermissionMode = *incoming.DefaultPermissionMode
+	}
+	if incoming.DefaultModel != nil {
+		s.cfg.DefaultModel = *incoming.DefaultModel
+	}
+	if incoming.DefaultEffort != nil {
+		s.cfg.DefaultEffort = *incoming.DefaultEffort
 	}
 
 	if err := s.cfg.Save(); err != nil {

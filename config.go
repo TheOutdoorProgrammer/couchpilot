@@ -7,10 +7,12 @@ import (
 )
 
 type Config struct {
-	Port                   int      `json:"port"`
-	DefaultDir             string   `json:"defaultDir"`
-	FavoriteDirs           []string `json:"favoriteDirs"`
-	DefaultSkipPermissions bool     `json:"defaultSkipPermissions"`
+	Port                  int      `json:"port"`
+	DefaultDir            string   `json:"defaultDir"`
+	FavoriteDirs          []string `json:"favoriteDirs"`
+	DefaultPermissionMode string   `json:"defaultPermissionMode"`
+	DefaultModel          string   `json:"defaultModel"`
+	DefaultEffort         string   `json:"defaultEffort"`
 
 	configPath string
 }
@@ -24,7 +26,7 @@ func LoadConfig() (*Config, error) {
 		Port:                   7080,
 		DefaultDir:             "~/",
 		FavoriteDirs:           []string{"~/"},
-		DefaultSkipPermissions: true,
+		DefaultPermissionMode: "bypassPermissions",
 		configPath:             configPath,
 	}
 
