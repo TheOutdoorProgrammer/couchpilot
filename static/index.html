@@ -46,8 +46,25 @@
         </div>
         <div class="field">
           <label>Working Directory</label>
-          <div id="dir-chips" class="chips"></div>
-          <input type="text" id="session-dir" name="dir" placeholder="~/" autocomplete="off">
+          <div class="picker" id="dir-picker">
+            <button type="button" class="picker-trigger" id="dir-picker-trigger">
+              <span class="picker-value" id="dir-picker-value">Pick a project…</span>
+              <span class="picker-chevron" aria-hidden="true">▾</span>
+            </button>
+          </div>
+          <input type="hidden" id="session-dir-value">
+          <input type="text" id="session-dir" name="dir" placeholder="Custom path..." autocomplete="off" style="display:none;margin-top:8px;">
+        </div>
+        <div class="field">
+          <label for="session-branch">Branch</label>
+          <select id="session-branch" class="select-field">
+            <option value="">(current branch)</option>
+          </select>
+          <div id="session-branch-new" style="display:none;margin-top:8px;">
+            <input type="text" id="session-branch-custom" placeholder="New branch name..." autocomplete="off">
+            <label class="from-label" for="session-branch-from">From</label>
+            <select id="session-branch-from" class="select-field"></select>
+          </div>
         </div>
         <div class="field">
           <label for="perm-mode">Permission Mode</label>
@@ -109,6 +126,19 @@
       <div class="modal-handle"></div>
       <h2>Settings</h2>
       <div class="field">
+        <label>Claude Authentication</label>
+        <button type="button" id="open-login-btn" class="btn btn-secondary btn-full">Run claude login</button>
+      </div>
+      <div class="field">
+        <label>Project Roots</label>
+        <p class="subtle" style="margin-bottom:6px;">Parent folders containing many projects. Their subdirectories appear in the directory picker.</p>
+        <div id="project-roots" class="fav-list"></div>
+        <div class="add-row">
+          <input type="text" id="new-project-root" placeholder="e.g. ~/Documents/Programming">
+          <button type="button" id="add-project-root-btn" class="btn btn-small">Add</button>
+        </div>
+      </div>
+      <div class="field">
         <label>Favorite Directories</label>
         <div id="fav-dirs" class="fav-list"></div>
         <div class="add-row">
@@ -165,6 +195,56 @@
       <div class="form-actions">
         <button type="button" class="btn btn-ghost" data-dismiss="settings-modal">Close</button>
         <button type="button" id="save-settings" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="dir-picker-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-sheet picker-modal-sheet">
+      <div class="modal-handle"></div>
+      <div class="picker-modal-header">
+        <input type="text" class="picker-search" id="dir-picker-search" placeholder="Search projects…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="button" class="picker-close" data-dismiss="dir-picker-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="picker-list" id="dir-picker-list"></div>
+    </div>
+  </div>
+
+  <div id="login-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-sheet">
+      <div class="modal-handle"></div>
+      <h2>Claude Login</h2>
+      <p class="subtle" id="login-hint">Runs <code>claude auth login</code> in a pseudo-terminal. Open the URL it prints, then paste the code back below.</p>
+      <div class="field">
+        <label for="login-method">Auth Method</label>
+        <select id="login-method" class="select-field">
+          <option value="claudeai">Claude subscription (default)</option>
+          <option value="console">Anthropic Console (API billing)</option>
+          <option value="sso">SSO</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="login-email">Email (optional)</label>
+        <input type="email" id="login-email" placeholder="you@example.com" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </div>
+      <pre id="login-output" class="terminal-output" aria-live="polite"></pre>
+      <div class="terminal-keys">
+        <button type="button" class="key-btn" data-key="up" title="Up">&uarr;</button>
+        <button type="button" class="key-btn" data-key="down" title="Down">&darr;</button>
+        <button type="button" class="key-btn" data-key="enter" title="Enter">Enter</button>
+        <button type="button" class="key-btn" data-key="esc" title="Esc">Esc</button>
+        <button type="button" class="key-btn" data-key="ctrl-c" title="Ctrl-C">Ctrl-C</button>
+      </div>
+      <div class="add-row">
+        <input type="text" id="login-input" placeholder="Type or paste here, then Send..." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="button" id="login-send" class="btn btn-small">Send</button>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-ghost" data-dismiss="login-modal">Close</button>
+        <button type="button" id="login-stop-btn" class="btn btn-danger" style="display:none;">Stop</button>
+        <button type="button" id="login-start-btn" class="btn btn-primary">Start</button>
       </div>
     </div>
   </div>

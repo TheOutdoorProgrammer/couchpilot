@@ -10,6 +10,7 @@ type Config struct {
 	Port                  int      `json:"port"`
 	DefaultDir            string   `json:"defaultDir"`
 	FavoriteDirs          []string `json:"favoriteDirs"`
+	ProjectRoots          []string `json:"projectRoots"`
 	DefaultPermissionMode string   `json:"defaultPermissionMode"`
 	DefaultModel          string   `json:"defaultModel"`
 	DefaultEffort         string   `json:"defaultEffort"`
@@ -23,11 +24,11 @@ func LoadConfig() (*Config, error) {
 	configPath := filepath.Join(configDir, "config.json")
 
 	cfg := &Config{
-		Port:                   7080,
-		DefaultDir:             "~/",
-		FavoriteDirs:           []string{"~/"},
+		Port:                  7080,
+		DefaultDir:            "~/",
+		FavoriteDirs:          []string{"~/"},
 		DefaultPermissionMode: "bypassPermissions",
-		configPath:             configPath,
+		configPath:            configPath,
 	}
 
 	data, err := os.ReadFile(configPath)

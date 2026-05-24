@@ -31,15 +31,15 @@ const (
 )
 
 type Session struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Dir       string        `json:"dir"`
-	PID       int           `json:"pid"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	Dir            string        `json:"dir"`
+	PID            int           `json:"pid"`
 	URL            string        `json:"url"`
 	Status         SessionStatus `json:"status"`
 	PermissionMode string        `json:"permissionMode"`
-	CreatedAt time.Time     `json:"createdAt"`
-	DiedAt    *time.Time    `json:"diedAt,omitempty"`
+	CreatedAt      time.Time     `json:"createdAt"`
+	DiedAt         *time.Time    `json:"diedAt,omitempty"`
 
 	cmd *exec.Cmd `json:"-"`
 }
@@ -62,12 +62,24 @@ func NewSessionManager(dataDir string, hub *SSEHub) *SessionManager {
 	return sm
 }
 
-func (sm *SessionManager) CreateSession(name, dir, permMode, model, effort string) (*Session, error) {
+type CreateSessionOpts struct {
+	Name         string
+	Dir          string
+	PermMode     string
+	Model        string
+	Effort       string
+	Branch       string
+	CreateBranch bool
+	BranchFrom   string
+}
+
+func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error) {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, err
 	}
 
+	dir := opts.Dir
 	if strings.HasPrefix(dir, "~/") {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, dir[2:])
@@ -75,9 +87,28 @@ func (sm *SessionManager) CreateSession(name, dir, permMode, model, effort strin
 		dir, _ = os.UserHomeDir()
 	}
 
+	name := opts.Name
 	if name == "" {
 		name = generateName()
 	}
+
+	branch := strings.TrimSpace(opts.Branch)
+	if branch != "" {
+		if !isGitRepo(dir) {
+			log.Printf("skipping branch %q: %s is not a git repository", branch, dir)
+		} else if err := CheckoutBranch(dir, branch, opts.CreateBranch, opts.BranchFrom); err != nil {
+			verb := "checkout"
+			if opts.CreateBranch {
+				verb = "create"
+			}
+			return nil, fmt.Errorf("%s branch %q: %w", verb, branch, err)
+		}
+		InvalidateProjectCache(opts.Dir)
+	}
+
+	permMode := opts.PermMode
+	model := opts.Model
+	effort := opts.Effort
 
 	args := []string{"--remote-control", name}
 	if permMode == "bypassPermissions" {
