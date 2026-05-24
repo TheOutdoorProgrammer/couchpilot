@@ -54,11 +54,12 @@ func (h *SSEHub) Broadcast(event SSEEvent) {
 type Server struct {
 	cfg *Config
 	sm  *SessionManager
+	lm  *LoginManager
 	hub *SSEHub
 }
 
-func NewServer(cfg *Config, sm *SessionManager, hub *SSEHub) *Server {
-	return &Server{cfg: cfg, sm: sm, hub: hub}
+func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub) *Server {
+	return &Server{cfg: cfg, sm: sm, lm: lm, hub: hub}
 }
 
 func (s *Server) Start() error {
@@ -81,6 +82,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/events", s.handleSSE)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
+	mux.HandleFunc("GET /api/projects", s.handleListProjects)
+	mux.HandleFunc("GET /api/branches", s.handleListBranches)
+	mux.HandleFunc("GET /api/login", s.handleLoginState)
+	mux.HandleFunc("POST /api/login", s.handleLoginStart)
+	mux.HandleFunc("POST /api/login/input", s.handleLoginInput)
+	mux.HandleFunc("DELETE /api/login", s.handleLoginStop)
 
 	return http.ListenAndServe(fmt.Sprintf(":%d", s.cfg.Port), mux)
 }
@@ -96,6 +103,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		PermissionMode string `json:"permissionMode"`
 		Model          string `json:"model"`
 		Effort         string `json:"effort"`
+		Branch         string `json:"branch"`
+		CreateBranch   bool   `json:"createBranch"`
+		BranchFrom     string `json:"branchFrom"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, "invalid request body", http.StatusBadRequest)
@@ -122,7 +132,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		effort = s.cfg.DefaultEffort
 	}
 
-	session, err := s.sm.CreateSession(req.Name, dir, permMode, model, effort)
+	session, err := s.sm.CreateSession(CreateSessionOpts{
+		Name:         req.Name,
+		Dir:          dir,
+		PermMode:     permMode,
+		Model:        model,
+		Effort:       effort,
+		Branch:       req.Branch,
+		CreateBranch: req.CreateBranch,
+		BranchFrom:   req.BranchFrom,
+	})
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,6 +149,48 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, session)
+}
+
+func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	type job struct {
+		path, group string
+	}
+	var jobs []job
+	for _, p := range s.cfg.FavoriteDirs {
+		jobs = append(jobs, job{p, "Favorites"})
+	}
+	for _, root := range s.cfg.ProjectRoots {
+		for _, child := range ListSubdirs(root) {
+			jobs = append(jobs, job{child, root})
+		}
+	}
+
+	out := make([]ProjectStatus, len(jobs))
+	sem := make(chan struct{}, 16)
+	var wg sync.WaitGroup
+	for i, j := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, path, group string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ps := GetProjectStatusCached(path)
+			ps.Group = group
+			out[i] = ps
+		}(i, j.path, j.group)
+	}
+	wg.Wait()
+
+	writeJSON(w, out)
+}
+
+func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeJSON(w, []string{})
+		return
+	}
+	writeJSON(w, GetBranches(path))
 }
 
 func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +241,48 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleLoginState(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.lm.State())
+}
+
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	var opts LoginOptions
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+			httpError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+	}
+	if err := s.lm.Start(opts); err != nil {
+		httpError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, s.lm.State())
+}
+
+func (s *Server) handleLoginInput(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Data string `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := s.lm.SendInput(req.Data); err != nil {
+		httpError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleLoginStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.lm.Stop(); err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.cfg)
 }
@@ -188,6 +291,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	var incoming struct {
 		DefaultDir            *string  `json:"defaultDir"`
 		FavoriteDirs          []string `json:"favoriteDirs"`
+		ProjectRoots          []string `json:"projectRoots"`
 		DefaultPermissionMode *string  `json:"defaultPermissionMode"`
 		DefaultModel          *string  `json:"defaultModel"`
 		DefaultEffort         *string  `json:"defaultEffort"`
@@ -202,6 +306,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if incoming.FavoriteDirs != nil {
 		s.cfg.FavoriteDirs = incoming.FavoriteDirs
+	}
+	if incoming.ProjectRoots != nil {
+		s.cfg.ProjectRoots = incoming.ProjectRoots
 	}
 	if incoming.DefaultPermissionMode != nil {
 		s.cfg.DefaultPermissionMode = *incoming.DefaultPermissionMode

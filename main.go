@@ -34,7 +34,8 @@ func main() {
 
 	hub := NewSSEHub()
 	sm := NewSessionManager(cfg.DataDir(), hub)
-	srv := NewServer(cfg, sm, hub)
+	lm := NewLoginManager(hub)
+	srv := NewServer(cfg, sm, lm, hub)
 
 	log.Printf("couchpilot listening on http://localhost:%d", cfg.Port)
 	if err := srv.Start(); err != nil {
