@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+const DefaultClaudeSessionLimit = 50
 
 type ClaudeSession struct {
 	ID             string    `json:"id"`
@@ -30,23 +34,23 @@ func ClaudeProjectsDir() string {
 	return filepath.Join(home, ".claude", "projects")
 }
 
-// ListClaudeSessions walks ~/.claude/projects/* and returns recent sessions
-// sorted by last-modified, most recent first. Limit <= 0 means no limit.
-func ListClaudeSessions(limit int) []ClaudeSession {
+type pendingFile struct {
+	path string
+	info os.FileInfo
+}
+
+// enumerateSessionFiles walks ~/.claude/projects/* and returns every .jsonl
+// session file with its stat info. Cheap — no file contents are read.
+func enumerateSessionFiles() []pendingFile {
 	root := ClaudeProjectsDir()
 	if root == "" {
 		return nil
 	}
-
 	projects, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
 
-	type pendingFile struct {
-		path string
-		info os.FileInfo
-	}
 	var files []pendingFile
 	for _, p := range projects {
 		if !p.IsDir() {
@@ -68,6 +72,21 @@ func ListClaudeSessions(limit int) []ClaudeSession {
 			files = append(files, pendingFile{path: full, info: info})
 		}
 	}
+	return files
+}
+
+// ListClaudeSessions returns the most-recent past sessions sorted by mtime
+// desc, alongside the total number of sessions on disk so callers can decide
+// whether to fetch more. Limit <= 0 means no cap.
+//
+// Parse work is dispatched across NumCPU workers via a jobs channel so opening
+// the resume picker stays snappy even when individual session files are large.
+func ListClaudeSessions(limit int) (sessions []ClaudeSession, total int) {
+	files := enumerateSessionFiles()
+	total = len(files)
+	if total == 0 {
+		return nil, 0
+	}
 
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].info.ModTime().After(files[j].info.ModTime())
@@ -76,15 +95,59 @@ func ListClaudeSessions(limit int) []ClaudeSession {
 		files = files[:limit]
 	}
 
-	out := make([]ClaudeSession, 0, len(files))
-	for _, f := range files {
-		s, ok := parseClaudeSession(f.path, f.info)
-		if !ok {
-			continue
-		}
-		out = append(out, s)
+	type indexed struct {
+		idx int
+		s   ClaudeSession
+		ok  bool
 	}
-	return out
+
+	workers := runtime.NumCPU()
+	if workers > len(files) {
+		workers = len(files)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	jobs := make(chan int, len(files))
+	results := make(chan indexed, len(files))
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				s, ok := parseClaudeSession(files[i].path, files[i].info)
+				results <- indexed{idx: i, s: s, ok: ok}
+			}
+		}()
+	}
+
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	parsed := make([]ClaudeSession, len(files))
+	ok := make([]bool, len(files))
+	for r := range results {
+		parsed[r.idx] = r.s
+		ok[r.idx] = r.ok
+	}
+
+	sessions = make([]ClaudeSession, 0, len(parsed))
+	for i, fine := range ok {
+		if fine {
+			sessions = append(sessions, parsed[i])
+		}
+	}
+	return sessions, total
 }
 
 // parseClaudeSession scans a JSONL session file and pulls out metadata.

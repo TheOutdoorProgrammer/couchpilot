@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 )
 
@@ -247,7 +248,18 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListClaudeSessions(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, ListClaudeSessions(50))
+	limit := DefaultClaudeSessionLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			limit = n
+		}
+	}
+	sessions, total := ListClaudeSessions(limit)
+	writeJSON(w, map[string]any{
+		"sessions": sessions,
+		"total":    total,
+		"limit":    limit,
+	})
 }
 
 func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {

@@ -40,8 +40,9 @@ async function fetchBranches(path) {
   return api('/branches?path=' + encodeURIComponent(path));
 }
 
-async function fetchClaudeSessions() {
-  return api('/claude-sessions');
+async function fetchClaudeSessions(limit) {
+  const q = limit && limit > 0 ? '?limit=' + encodeURIComponent(limit) : '';
+  return api('/claude-sessions' + q);
 }
 
 async function createSession(data) {
@@ -419,21 +420,35 @@ function renderPluginDirs() {
   ).join('');
 }
 
+const RESUME_PAGE_SIZE = 50;
 let resumeSessions = [];
+let resumeTotal = 0;
+let resumeLoading = false;
 
 async function openResumeModal() {
   resumeSessions = [];
+  resumeTotal = 0;
   document.getElementById('resume-search').value = '';
   document.getElementById('resume-list').innerHTML = '<div class="picker-empty">Loading…</div>';
   openModal('resume-modal');
+  await loadResumeSessions(RESUME_PAGE_SIZE);
+}
+
+async function loadResumeSessions(limit) {
+  if (resumeLoading) return;
+  resumeLoading = true;
   try {
-    resumeSessions = (await fetchClaudeSessions()) || [];
+    const resp = await fetchClaudeSessions(limit);
+    resumeSessions = (resp && resp.sessions) || [];
+    resumeTotal = (resp && resp.total) || resumeSessions.length;
   } catch (err) {
     document.getElementById('resume-list').innerHTML =
       `<div class="picker-empty">Failed to load: ${esc(err.message)}</div>`;
     return;
+  } finally {
+    resumeLoading = false;
   }
-  renderResumeList('');
+  renderResumeList(document.getElementById('resume-search').value || '');
 }
 
 function renderResumeList(query) {
@@ -454,7 +469,15 @@ function renderResumeList(query) {
     return;
   }
 
-  list.innerHTML = filtered.map(renderResumeItem).join('');
+  let html = filtered.map(renderResumeItem).join('');
+  const remaining = resumeTotal - resumeSessions.length;
+  if (!q && remaining > 0) {
+    const label = resumeLoading ? 'Loading…' : `Show all (${remaining} more)`;
+    html += `<button type="button" class="picker-item picker-item-custom" id="resume-load-more"${resumeLoading ? ' disabled' : ''}>
+      <div class="picker-item-main"><span class="picker-item-name">${label}</span></div>
+    </button>`;
+  }
+  list.innerHTML = html;
 }
 
 function renderResumeItem(s) {
@@ -517,7 +540,13 @@ function bindEvents() {
     resumeSearchDebounce = setTimeout(() => renderResumeList(val), 60);
   });
 
-  document.getElementById('resume-list').addEventListener('click', (e) => {
+  document.getElementById('resume-list').addEventListener('click', async (e) => {
+    if (e.target.closest('#resume-load-more')) {
+      const btn = document.getElementById('resume-load-more');
+      if (btn) btn.disabled = true;
+      await loadResumeSessions(0);
+      return;
+    }
     const item = e.target.closest('.resume-item');
     if (!item) return;
     resumeSelectedSession(item.dataset.id);

@@ -16,6 +16,12 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+html, body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   background: var(--bg);
@@ -23,7 +29,7 @@ body {
   min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
-  overflow-x: hidden;
+  position: relative;
 }
 
 body.modal-open {
@@ -118,9 +124,9 @@ main {
   font-weight: 600;
   font-size: 15px;
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .session-meta {
@@ -129,8 +135,12 @@ main {
   font-size: 13px;
   color: var(--text-secondary);
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .session-meta .sep { opacity: 0.4; }
@@ -219,8 +229,10 @@ main {
 .resume-item {
   text-align: left;
   width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 4px;
   padding: 12px 14px;
 }
@@ -229,9 +241,9 @@ main {
   font-size: 15px;
   font-weight: 500;
   color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .resume-item-prompt {
@@ -242,6 +254,9 @@ main {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .resume-item-meta {
@@ -251,6 +266,9 @@ main {
   font-size: 12px;
   color: var(--text-secondary);
   align-items: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .resume-item-meta .branch-chip { font-size: 11px; }
@@ -776,6 +794,7 @@ main {
 
 .picker-list {
   overflow-y: auto;
+  overflow-x: hidden;
   flex: 1;
   padding: 4px 0 12px;
   -webkit-overflow-scrolling: touch;
