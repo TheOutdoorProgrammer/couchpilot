@@ -76,6 +76,7 @@ type CreateSessionOpts struct {
 	Branch       string
 	CreateBranch bool
 	BranchFrom   string
+	ResumeID     string
 }
 
 func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error) {
@@ -132,6 +133,9 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 	}
 	for _, pd := range opts.PluginDirs {
 		args = append(args, "--plugin-dir", pd)
+	}
+	if opts.ResumeID != "" {
+		args = append(args, "--resume", opts.ResumeID)
 	}
 
 	cmd := exec.Command(claudePath, args...)

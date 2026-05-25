@@ -32,7 +32,15 @@
     </div>
   </main>
 
-  <button id="new-btn" class="fab">+ New Session</button>
+  <div class="fab-row">
+    <button id="resume-btn" class="fab fab-icon" aria-label="Resume session" title="Resume a recent Claude session">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+        <path d="M3 3v5h5"/>
+      </svg>
+    </button>
+    <button id="new-btn" class="fab">+ New Session</button>
+  </div>
 
   <div id="new-modal" class="modal">
     <div class="modal-backdrop"></div>
@@ -269,6 +277,20 @@
         <button type="button" class="btn btn-ghost" data-dismiss="login-modal">Close</button>
         <button type="button" id="login-stop-btn" class="btn btn-danger" style="display:none;">Stop</button>
         <button type="button" id="login-start-btn" class="btn btn-primary">Start</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="resume-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-sheet picker-modal-sheet">
+      <div class="modal-handle"></div>
+      <div class="picker-modal-header">
+        <input type="text" class="picker-search" id="resume-search" placeholder="Search recent sessions…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="button" class="picker-close" data-dismiss="resume-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="picker-list" id="resume-list">
+        <div class="picker-empty">Loading…</div>
       </div>
     </div>
   </div>
