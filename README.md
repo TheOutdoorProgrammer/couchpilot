@@ -82,6 +82,68 @@ Each session spawns a `claude remote-control --spawn session` process. couchpilo
 
 Session state is persisted to `~/.config/couchpilot/sessions.json`. If couchpilot restarts, it checks which processes are still alive and re-adopts them.
 
+## iMessage Channels
+
+couchpilot can auto-launch a channels session that bridges iMessage to Claude Code. When `channelsEnabled: true` in config, it spawns a dedicated "channels" session on startup and auto-restarts it if it dies.
+
+### Using a forked iMessage plugin
+
+To use a forked plugin (e.g., `imessage@theoutdoorprogrammer` instead of the official `imessage@claude-plugins-official`), three things are required:
+
+**1. Managed settings allowlist** (requires sudo):
+
+```bash
+sudo mkdir -p "/Library/Application Support/ClaudeCode"
+# Create managed-settings.json with:
+{
+  "allowedChannelPlugins": [
+    { "marketplace": "theoutdoorprogrammer", "plugin": "imessage" }
+  ]
+}
+```
+
+Claude Code only honors `allowedChannelPlugins` from managed settings — putting it in `~/.claude/settings.json` does nothing.
+
+**2. Fake marketplace registration:**
+
+Claude Code resolves `plugin:name@marketplace` by looking up `~/.claude/plugins/marketplaces/<marketplace>/`. Create:
+
+```
+~/.claude/plugins/marketplaces/theoutdoorprogrammer/
+├── .claude-plugin/marketplace.json    # manifest listing the plugin
+└── external_plugins/
+    └── imessage -> /path/to/your/fork  # symlink to fork source
+```
+
+Register it in `~/.claude/plugins/known_marketplaces.json`:
+
+```json
+{
+  "theoutdoorprogrammer": {
+    "source": { "source": "local", "path": "..." },
+    "installLocation": "~/.claude/plugins/marketplaces/theoutdoorprogrammer",
+    "lastUpdated": "..."
+  }
+}
+```
+
+**3. Config:**
+
+```json
+{
+  "defaultChannels": "plugin:imessage@theoutdoorprogrammer",
+  "pluginDirs": ["/path/to/your/fork"],
+  "channelsEnabled": true
+}
+```
+
+### What doesn't work
+
+- `allowedChannelPlugins` in user settings — silently ignored
+- `--dangerously-load-development-channels` — interactive prompt, unreliable delivery
+- Symlinks in `~/.claude/plugins/cache/` — destroyed on every session start
+- `--plugin-dir` alone without marketplace — plugin loads but channel identifier can't resolve
+
 ## Requirements
 
 - **Go 1.22+** (for building)
