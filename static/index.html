@@ -194,6 +194,28 @@
           <option value="low">Low</option>
         </select>
       </div>
+      <div class="field">
+        <label class="toggle-label">
+          <input type="checkbox" id="channels-enabled">
+          <span>Channels Session</span>
+        </label>
+        <p class="subtle" style="margin-bottom:6px;">Auto-start a dedicated "channels" session on boot. It stays running and auto-restarts if it dies.</p>
+      </div>
+      <div id="channels-config" style="display:none;">
+        <div class="field">
+          <label for="default-channels">Channel</label>
+          <input type="text" id="default-channels" placeholder="e.g. plugin:imessage@claude-plugins-official" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Plugin Directories</label>
+          <p class="subtle" style="margin-bottom:6px;">Local plugin directories loaded via --plugin-dir on the channels session.</p>
+          <div id="plugin-dirs" class="fav-list"></div>
+          <div class="add-row">
+            <input type="text" id="new-plugin-dir" placeholder="e.g. ~/projects/src/github.com/TheOutdoorProgrammer/claude-imessage">
+            <button type="button" id="add-plugin-dir-btn" class="btn btn-small">Add</button>
+          </div>
+        </div>
+      </div>
       <div class="form-actions">
         <button type="button" class="btn btn-ghost" data-dismiss="settings-modal">Close</button>
         <button type="button" id="save-settings" class="btn btn-primary">Save</button>

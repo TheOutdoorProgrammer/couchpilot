@@ -14,6 +14,9 @@ type Config struct {
 	DefaultPermissionMode string   `json:"defaultPermissionMode"`
 	DefaultModel          string   `json:"defaultModel"`
 	DefaultEffort         string   `json:"defaultEffort"`
+	DefaultChannels       string   `json:"defaultChannels"`
+	PluginDirs            []string `json:"pluginDirs"`
+	ChannelsEnabled       bool     `json:"channelsEnabled"`
 
 	configPath string
 }

@@ -52,6 +52,10 @@ async function dismissSession(id) {
   return api('/sessions/' + id + '/dismiss', { method: 'POST' });
 }
 
+async function restartChannels() {
+  return api('/channels/restart', { method: 'POST' });
+}
+
 async function saveConfig(data) {
   config = await api('/config', { method: 'PUT', body: JSON.stringify(data) });
 }
@@ -166,7 +170,15 @@ function renderSessions() {
       : timeAgo(s.createdAt);
 
     let actions = '';
-    if (isExpanded && !isDead) {
+    if (isExpanded && s.isChannels) {
+      const openLink = s.url
+        ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="btn-open">Open in Claude</a>`
+        : `<span class="btn-open" style="opacity:0.4;pointer-events:none">${isDead ? 'Restarting...' : 'Waiting for URL...'}</span>`;
+      actions = `<div class="session-actions">
+        ${openLink}
+        <button class="btn-restart" data-restart-channels>Restart</button>
+      </div>`;
+    } else if (isExpanded && !isDead) {
       const openLink = s.url
         ? `<a href="${esc(s.url)}" target="_blank" rel="noopener" class="btn-open">Open in Claude</a>`
         : `<span class="btn-open" style="opacity:0.4;pointer-events:none">Waiting for URL...</span>`;
@@ -393,6 +405,16 @@ function renderProjectRoots() {
   ).join('');
 }
 
+function renderPluginDirs() {
+  const container = document.getElementById('plugin-dirs');
+  container.innerHTML = (config.pluginDirs || []).map(d =>
+    `<div class="fav-item">
+      <span>${esc(d)}</span>
+      <button class="fav-remove" data-remove-plugin-dir="${esc(d)}">&times;</button>
+    </div>`
+  ).join('');
+}
+
 // --- Events ---
 
 function bindEvents() {
@@ -406,6 +428,10 @@ function bindEvents() {
     document.getElementById('default-perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
     setModelSelect('default-model', 'default-model-custom', config.defaultModel || '');
     document.getElementById('default-effort').value = config.defaultEffort || '';
+    document.getElementById('channels-enabled').checked = !!config.channelsEnabled;
+    document.getElementById('channels-config').style.display = config.channelsEnabled ? '' : 'none';
+    document.getElementById('default-channels').value = config.defaultChannels || '';
+    renderPluginDirs();
     openModal('settings-modal');
   });
 
@@ -421,6 +447,13 @@ function bindEvents() {
           toast(err.message, true);
         }
       });
+      return;
+    }
+
+    const restartBtn = e.target.closest('[data-restart-channels]');
+    if (restartBtn) {
+      e.stopPropagation();
+      restartChannels().then(() => toast('Channels restarting...')).catch(err => toast(err.message, true));
       return;
     }
 
@@ -536,6 +569,9 @@ function bindEvents() {
         defaultPermissionMode: document.getElementById('default-perm-mode').value,
         defaultModel: getModelValue('default-model', 'default-model-custom'),
         defaultEffort: document.getElementById('default-effort').value,
+        channelsEnabled: document.getElementById('channels-enabled').checked,
+        defaultChannels: document.getElementById('default-channels').value.trim(),
+        pluginDirs: config.pluginDirs || [],
       });
       closeModal('settings-modal');
       toast('Settings saved');
@@ -582,6 +618,30 @@ function bindEvents() {
       config.projectRoots = (config.projectRoots || []).filter(d => d !== btn.dataset.removeRoot);
       renderProjectRoots();
     }
+  });
+
+  document.getElementById('add-plugin-dir-btn').addEventListener('click', () => {
+    const input = document.getElementById('new-plugin-dir');
+    const val = input.value.trim();
+    if (!val) return;
+    if (!config.pluginDirs) config.pluginDirs = [];
+    if (!config.pluginDirs.includes(val)) {
+      config.pluginDirs.push(val);
+      renderPluginDirs();
+    }
+    input.value = '';
+  });
+
+  document.getElementById('plugin-dirs').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-remove-plugin-dir]');
+    if (btn) {
+      config.pluginDirs = (config.pluginDirs || []).filter(d => d !== btn.dataset.removePluginDir);
+      renderPluginDirs();
+    }
+  });
+
+  document.getElementById('channels-enabled').addEventListener('change', (e) => {
+    document.getElementById('channels-config').style.display = e.target.checked ? '' : 'none';
   });
 
   document.getElementById('session-model').addEventListener('change', (e) => {

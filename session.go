@@ -38,6 +38,7 @@ type Session struct {
 	URL            string        `json:"url"`
 	Status         SessionStatus `json:"status"`
 	PermissionMode string        `json:"permissionMode"`
+	IsChannels     bool          `json:"isChannels"`
 	CreatedAt      time.Time     `json:"createdAt"`
 	DiedAt         *time.Time    `json:"diedAt,omitempty"`
 
@@ -45,10 +46,11 @@ type Session struct {
 }
 
 type SessionManager struct {
-	sessions map[string]*Session
-	mu       sync.RWMutex
-	hub      *SSEHub
-	dataDir  string
+	sessions       map[string]*Session
+	mu             sync.RWMutex
+	hub            *SSEHub
+	dataDir        string
+	onChannelsDied func()
 }
 
 func NewSessionManager(dataDir string, hub *SSEHub) *SessionManager {
@@ -68,6 +70,9 @@ type CreateSessionOpts struct {
 	PermMode     string
 	Model        string
 	Effort       string
+	Channels     string
+	PluginDirs   []string
+	IsChannels   bool
 	Branch       string
 	CreateBranch bool
 	BranchFrom   string
@@ -122,6 +127,12 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 	if effort != "" {
 		args = append(args, "--effort", effort)
 	}
+	if opts.Channels != "" {
+		args = append(args, "--channels", opts.Channels)
+	}
+	for _, pd := range opts.PluginDirs {
+		args = append(args, "--plugin-dir", pd)
+	}
 
 	cmd := exec.Command(claudePath, args...)
 	cmd.Dir = dir
@@ -138,6 +149,7 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 		PID:            cmd.Process.Pid,
 		Status:         StatusStarting,
 		PermissionMode: permMode,
+		IsChannels:     opts.IsChannels,
 		CreatedAt:      time.Now(),
 		cmd:            cmd,
 	}
@@ -251,9 +263,17 @@ func (sm *SessionManager) markDead(id string) {
 	now := time.Now()
 	s.Status = StatusDead
 	s.DiedAt = &now
+	isChannels := s.IsChannels
 	sm.mu.Unlock()
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_died", Data: s})
+
+	if isChannels && sm.onChannelsDied != nil {
+		go func() {
+			time.Sleep(3 * time.Second)
+			sm.onChannelsDied()
+		}()
+	}
 }
 
 func (sm *SessionManager) recover() {

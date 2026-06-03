@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"sync"
 )
@@ -59,10 +60,18 @@ type Server struct {
 }
 
 func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub) *Server {
-	return &Server{cfg: cfg, sm: sm, lm: lm, hub: hub}
+	srv := &Server{cfg: cfg, sm: sm, lm: lm, hub: hub}
+
+	sm.onChannelsDied = func() {
+		srv.ensureChannelsSession()
+	}
+
+	return srv
 }
 
 func (s *Server) Start() error {
+	s.ensureChannelsSession()
+
 	mux := http.NewServeMux()
 
 	sub, _ := fs.Sub(staticFS, "static")
@@ -79,6 +88,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleKillSession)
 	mux.HandleFunc("POST /api/sessions/{id}/dismiss", s.handleDismissSession)
+	mux.HandleFunc("POST /api/channels/restart", s.handleRestartChannels)
 	mux.HandleFunc("GET /api/events", s.handleSSE)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
@@ -90,6 +100,55 @@ func (s *Server) Start() error {
 	mux.HandleFunc("DELETE /api/login", s.handleLoginStop)
 
 	return http.ListenAndServe(fmt.Sprintf(":%d", s.cfg.Port), mux)
+}
+
+func (s *Server) ensureChannelsSession() {
+	if !s.cfg.ChannelsEnabled || s.cfg.DefaultChannels == "" {
+		return
+	}
+
+	for _, sess := range s.sm.GetSessions() {
+		if sess.IsChannels && sess.Status != StatusDead {
+			return
+		}
+	}
+
+	s.dismissDeadChannelsSessions()
+	s.startChannelsSession()
+}
+
+func (s *Server) dismissDeadChannelsSessions() {
+	for _, sess := range s.sm.GetSessions() {
+		if sess.IsChannels && sess.Status == StatusDead {
+			s.sm.DismissSession(sess.ID)
+		}
+	}
+}
+
+func (s *Server) startChannelsSession() {
+	session, err := s.sm.CreateSession(CreateSessionOpts{
+		Name:       "channels",
+		Dir:        s.cfg.DefaultDir,
+		PermMode:   s.cfg.DefaultPermissionMode,
+		Model:      s.cfg.DefaultModel,
+		Effort:     s.cfg.DefaultEffort,
+		Channels:   s.cfg.DefaultChannels,
+		PluginDirs: s.cfg.PluginDirs,
+		IsChannels: true,
+	})
+	if err != nil {
+		log.Printf("channels session: failed to start: %v", err)
+		return
+	}
+	log.Printf("channels session started: %s (pid %d)", session.ID, session.PID)
+}
+
+func (s *Server) restartChannelsSession() {
+	for _, sess := range s.sm.GetSessions() {
+		if sess.IsChannels && sess.Status != StatusDead {
+			s.sm.KillSession(sess.ID)
+		}
+	}
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +254,15 @@ func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	s.sm.mu.RLock()
+	sess, ok := s.sm.sessions[id]
+	s.sm.mu.RUnlock()
+	if ok && sess.IsChannels {
+		httpError(w, "channels session cannot be killed — use restart", http.StatusForbidden)
+		return
+	}
+
 	if err := s.sm.KillSession(id); err != nil {
 		httpError(w, err.Error(), http.StatusNotFound)
 		return
@@ -205,6 +273,15 @@ func (s *Server) handleKillSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDismissSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.sm.DismissSession(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRestartChannels(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.ChannelsEnabled {
+		httpError(w, "channels not enabled", http.StatusBadRequest)
+		return
+	}
+	s.restartChannelsSession()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -295,6 +372,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		DefaultPermissionMode *string  `json:"defaultPermissionMode"`
 		DefaultModel          *string  `json:"defaultModel"`
 		DefaultEffort         *string  `json:"defaultEffort"`
+		DefaultChannels       *string  `json:"defaultChannels"`
+		PluginDirs            []string `json:"pluginDirs"`
+		ChannelsEnabled       *bool    `json:"channelsEnabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		httpError(w, err.Error(), http.StatusBadRequest)
@@ -319,11 +399,23 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if incoming.DefaultEffort != nil {
 		s.cfg.DefaultEffort = *incoming.DefaultEffort
 	}
+	if incoming.DefaultChannels != nil {
+		s.cfg.DefaultChannels = *incoming.DefaultChannels
+	}
+	if incoming.PluginDirs != nil {
+		s.cfg.PluginDirs = incoming.PluginDirs
+	}
+	if incoming.ChannelsEnabled != nil {
+		s.cfg.ChannelsEnabled = *incoming.ChannelsEnabled
+	}
 
 	if err := s.cfg.Save(); err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	s.ensureChannelsSession()
+
 	writeJSON(w, s.cfg)
 }
 
