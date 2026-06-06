@@ -40,6 +40,11 @@ async function fetchBranches(path) {
   return api('/branches?path=' + encodeURIComponent(path));
 }
 
+async function fetchClaudeSessions(limit) {
+  const q = limit && limit > 0 ? '?limit=' + encodeURIComponent(limit) : '';
+  return api('/claude-sessions' + q);
+}
+
 async function createSession(data) {
   return api('/sessions', { method: 'POST', body: JSON.stringify(data) });
 }
@@ -415,11 +420,136 @@ function renderPluginDirs() {
   ).join('');
 }
 
+const RESUME_PAGE_SIZE = 50;
+let resumeSessions = [];
+let resumeTotal = 0;
+let resumeLoading = false;
+
+async function openResumeModal() {
+  resumeSessions = [];
+  resumeTotal = 0;
+  document.getElementById('resume-search').value = '';
+  document.getElementById('resume-list').innerHTML = '<div class="picker-empty">Loading…</div>';
+  openModal('resume-modal');
+  await loadResumeSessions(RESUME_PAGE_SIZE);
+}
+
+async function loadResumeSessions(limit) {
+  if (resumeLoading) return;
+  resumeLoading = true;
+  try {
+    const resp = await fetchClaudeSessions(limit);
+    resumeSessions = (resp && resp.sessions) || [];
+    resumeTotal = (resp && resp.total) || resumeSessions.length;
+  } catch (err) {
+    document.getElementById('resume-list').innerHTML =
+      `<div class="picker-empty">Failed to load: ${esc(err.message)}</div>`;
+    return;
+  } finally {
+    resumeLoading = false;
+  }
+  renderResumeList(document.getElementById('resume-search').value || '');
+}
+
+function renderResumeList(query) {
+  const list = document.getElementById('resume-list');
+  const q = (query || '').toLowerCase().trim();
+
+  const filtered = q
+    ? resumeSessions.filter(s =>
+        (s.title || '').toLowerCase().includes(q) ||
+        (s.firstPrompt || '').toLowerCase().includes(q) ||
+        (s.cwd || '').toLowerCase().includes(q) ||
+        (s.gitBranch || '').toLowerCase().includes(q) ||
+        (s.id || '').toLowerCase().includes(q))
+    : resumeSessions;
+
+  if (filtered.length === 0) {
+    list.innerHTML = '<div class="picker-empty">No sessions found</div>';
+    return;
+  }
+
+  let html = filtered.map(renderResumeItem).join('');
+  const remaining = resumeTotal - resumeSessions.length;
+  if (!q && remaining > 0) {
+    const label = resumeLoading ? 'Loading…' : `Show all (${remaining} more)`;
+    html += `<button type="button" class="picker-item picker-item-custom" id="resume-load-more"${resumeLoading ? ' disabled' : ''}>
+      <div class="picker-item-main"><span class="picker-item-name">${label}</span></div>
+    </button>`;
+  }
+  list.innerHTML = html;
+}
+
+function renderResumeItem(s) {
+  const title = esc(s.title || s.firstPrompt || 'Untitled session');
+  const project = s.cwd ? shortenDir(s.cwd).split('/').filter(Boolean).pop() : 'unknown';
+  const branchChip = s.gitBranch ? `<span class="branch-chip">${esc(s.gitBranch)}</span>` : '';
+  const time = timeAgo(s.modifiedAt);
+  const prompt = s.firstPrompt && s.title
+    ? `<div class="resume-item-prompt">${esc(s.firstPrompt)}</div>`
+    : '';
+  return `<button type="button" class="picker-item resume-item" data-id="${esc(s.id)}">
+    <div class="resume-item-title">${title}</div>
+    ${prompt}
+    <div class="resume-item-meta">
+      <span>${esc(project)}</span>
+      ${branchChip}
+      <span class="sep">&middot;</span>
+      <span>${time}</span>
+    </div>
+  </button>`;
+}
+
+async function resumeSelectedSession(id) {
+  const session = resumeSessions.find(s => s.id === id);
+  if (!session) return;
+  if (!session.cwd) {
+    toast('Cannot resume: missing working directory', true);
+    return;
+  }
+  closeModal('resume-modal');
+  try {
+    const created = await createSession({
+      dir: session.cwd,
+      resumeId: session.id,
+      name: slugify(session.title),
+    });
+    if (created && created.id) {
+      expandedId = created.id;
+      render();
+    }
+    toast('Resuming session…');
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 // --- Events ---
 
 function bindEvents() {
   document.getElementById('new-btn').addEventListener('click', () => {
     openNewModal();
+  });
+
+  document.getElementById('resume-btn').addEventListener('click', openResumeModal);
+
+  let resumeSearchDebounce;
+  document.getElementById('resume-search').addEventListener('input', (e) => {
+    const val = e.target.value;
+    clearTimeout(resumeSearchDebounce);
+    resumeSearchDebounce = setTimeout(() => renderResumeList(val), 60);
+  });
+
+  document.getElementById('resume-list').addEventListener('click', async (e) => {
+    if (e.target.closest('#resume-load-more')) {
+      const btn = document.getElementById('resume-load-more');
+      if (btn) btn.disabled = true;
+      await loadResumeSessions(0);
+      return;
+    }
+    const item = e.target.closest('.resume-item');
+    if (!item) return;
+    resumeSelectedSession(item.dataset.id);
   });
 
   document.getElementById('settings-btn').addEventListener('click', () => {
@@ -906,6 +1036,14 @@ function getModelValue(selectId, customId) {
     return document.getElementById(customId).value;
   }
   return select.value;
+}
+
+function slugify(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
 }
 
 function esc(s) {

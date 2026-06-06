@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 )
 
@@ -94,6 +95,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("GET /api/branches", s.handleListBranches)
+	mux.HandleFunc("GET /api/claude-sessions", s.handleListClaudeSessions)
 	mux.HandleFunc("GET /api/login", s.handleLoginState)
 	mux.HandleFunc("POST /api/login", s.handleLoginStart)
 	mux.HandleFunc("POST /api/login/input", s.handleLoginInput)
@@ -165,6 +167,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Branch         string `json:"branch"`
 		CreateBranch   bool   `json:"createBranch"`
 		BranchFrom     string `json:"branchFrom"`
+		ResumeID       string `json:"resumeId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, "invalid request body", http.StatusBadRequest)
@@ -200,6 +203,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Branch:       req.Branch,
 		CreateBranch: req.CreateBranch,
 		BranchFrom:   req.BranchFrom,
+		ResumeID:     req.ResumeID,
 	})
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
@@ -241,6 +245,21 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 
 	writeJSON(w, out)
+}
+
+func (s *Server) handleListClaudeSessions(w http.ResponseWriter, r *http.Request) {
+	limit := DefaultClaudeSessionLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			limit = n
+		}
+	}
+	sessions, total := ListClaudeSessions(limit)
+	writeJSON(w, map[string]any{
+		"sessions": sessions,
+		"total":    total,
+		"limit":    limit,
+	})
 }
 
 func (s *Server) handleListBranches(w http.ResponseWriter, r *http.Request) {

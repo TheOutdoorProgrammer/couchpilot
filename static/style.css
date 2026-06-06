@@ -16,6 +16,12 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+html, body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   background: var(--bg);
@@ -23,7 +29,7 @@ body {
   min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
-  overflow-x: hidden;
+  position: relative;
 }
 
 body.modal-open {
@@ -118,9 +124,9 @@ main {
   font-weight: 600;
   font-size: 15px;
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .session-meta {
@@ -129,8 +135,12 @@ main {
   font-size: 13px;
   color: var(--text-secondary);
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .session-meta .sep { opacity: 0.4; }
@@ -168,11 +178,18 @@ main {
 
 /* FAB */
 
-.fab {
+.fab-row {
   position: fixed;
   bottom: calc(24px + env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 10;
+}
+
+.fab {
   background: var(--accent);
   color: white;
   border: none;
@@ -183,13 +200,78 @@ main {
   cursor: pointer;
   box-shadow: 0 4px 20px rgba(124, 58, 237, 0.4);
   transition: background 0.15s, transform 0.15s, box-shadow 0.15s;
-  z-index: 10;
   white-space: nowrap;
 }
 
 .fab:hover { background: var(--accent-hover); box-shadow: 0 6px 24px rgba(124, 58, 237, 0.5); }
-.fab:active { transform: translateX(-50%) scale(0.95); }
+.fab:active { transform: scale(0.95); }
 .fab:disabled { opacity: 0.5; pointer-events: none; }
+
+.fab-icon {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+.fab-icon:hover {
+  background: var(--surface-hover);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.resume-item {
+  text-align: left;
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 12px 14px;
+}
+
+.resume-item-title {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+.resume-item-prompt {
+  font-size: 13px;
+  color: var(--text-secondary);
+  opacity: 0.85;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+.resume-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  align-items: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.resume-item-meta .branch-chip { font-size: 11px; }
 
 /* Modal */
 
@@ -712,6 +794,7 @@ main {
 
 .picker-list {
   overflow-y: auto;
+  overflow-x: hidden;
   flex: 1;
   padding: 4px 0 12px;
   -webkit-overflow-scrolling: touch;
