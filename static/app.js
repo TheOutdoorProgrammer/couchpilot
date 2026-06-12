@@ -1,14 +1,38 @@
 let sessions = [];
 let config = {};
+let cachedModels = [];
 let expandedId = null;
 let confirmCallback = null;
 let eventSource = null;
 let loginRunning = false;
+let authStatus = {};
+let appStarted = false;
+let settingsDraft = {};
+let appVersion = '';
 
 document.addEventListener('DOMContentLoaded', init);
 
 async function init() {
+  bindAuthEvents();
+  fetchVersion();
+  try {
+    authStatus = await api('/auth/status');
+  } catch {
+    authStatus = { enabled: false, authed: true };
+  }
+  if (!authStatus.authed) {
+    showAuthGate();
+    return;
+  }
+  await startApp();
+}
+
+async function startApp() {
+  hideAuthGate();
+  if (appStarted) return;
+  appStarted = true;
   await fetchConfig();
+  await fetchModels();
   connectSSE();
   bindEvents();
 }
@@ -20,12 +44,144 @@ async function api(path, opts = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error('Session expired — please log in');
+  }
   if (!res.ok && res.status !== 204) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || res.statusText);
   }
   if (res.status === 204) return null;
   return res.json();
+}
+
+// --- Version ---
+
+async function fetchVersion() {
+  try {
+    const v = await api('/version');
+    appVersion = (v && v.version) ? v.version : '';
+  } catch {
+    appVersion = '';
+  }
+  renderVersionLabels();
+}
+
+function renderVersionLabels() {
+  let label = '';
+  if (appVersion) {
+    label = appVersion === 'dev'
+      ? 'couchpilot · dev build'
+      : 'couchpilot · v' + appVersion.replace(/^v/, '');
+  }
+  for (const id of ['auth-version', 'settings-version']) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = label;
+  }
+}
+
+// --- Auth ---
+
+// authReq talks to the auth endpoints without triggering the global 401
+// redirect (a wrong password on the login screen is expected, not a session
+// expiry).
+async function authReq(path, body, method = 'POST') {
+  const res = await fetch('/api' + path, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok && res.status !== 204) {
+    const b = await res.json().catch(() => ({}));
+    throw new Error(b.error || res.statusText);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+function showAuthGate() {
+  const gate = document.getElementById('auth-gate');
+  const needsSetup = !!authStatus.needsSetup;
+  document.getElementById('auth-login-form').hidden = needsSetup;
+  document.getElementById('auth-setup-form').hidden = !needsSetup;
+  gate.hidden = false;
+  renderVersionLabels();
+  document.body.classList.add('modal-open');
+  setTimeout(() => {
+    const id = needsSetup ? 'auth-setup-password' : 'auth-login-password';
+    document.getElementById(id).focus();
+  }, 60);
+}
+
+function hideAuthGate() {
+  document.getElementById('auth-gate').hidden = true;
+  if (!document.querySelector('.modal.active')) {
+    document.body.classList.remove('modal-open');
+  }
+}
+
+function handleUnauthorized() {
+  authStatus = { enabled: true, authed: false, needsSetup: false };
+  showAuthGate();
+}
+
+async function afterAuthSuccess() {
+  try {
+    authStatus = await api('/auth/status');
+  } catch {
+    authStatus = { enabled: true, authed: true };
+  }
+  const wasStarted = appStarted;
+  await startApp();
+  // On a re-auth (cookie expired while the app was open) startApp short-circuits,
+  // so refresh the SSE stream that died on 401. First-time start already connects.
+  if (wasStarted) connectSSE();
+}
+
+function bindAuthEvents() {
+  document.getElementById('auth-login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = document.getElementById('auth-login-error');
+    err.hidden = true;
+    const input = document.getElementById('auth-login-password');
+    try {
+      await authReq('/auth/login', { password: input.value });
+      input.value = '';
+      await afterAuthSuccess();
+    } catch (ex) {
+      err.textContent = ex.message || 'Login failed';
+      err.hidden = false;
+    }
+  });
+
+  document.getElementById('auth-setup-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = document.getElementById('auth-setup-error');
+    err.hidden = true;
+    const pw = document.getElementById('auth-setup-password').value;
+    const confirm = document.getElementById('auth-setup-confirm').value;
+    if (pw.length < 6) { err.textContent = 'Password must be at least 6 characters'; err.hidden = false; return; }
+    if (pw !== confirm) { err.textContent = 'Passwords do not match'; err.hidden = false; return; }
+    try {
+      await authReq('/auth/setup', { password: pw });
+      await afterAuthSuccess();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+    }
+  });
+
+  document.getElementById('auth-setup-disable').addEventListener('click', async () => {
+    const err = document.getElementById('auth-setup-error');
+    err.hidden = true;
+    try {
+      await authReq('/auth/setup', { disable: true });
+      await afterAuthSuccess();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+    }
+  });
 }
 
 async function fetchConfig() {
@@ -54,6 +210,154 @@ async function dismissSession(id) {
 
 async function restartChannels() {
   return api('/channels/restart', { method: 'POST' });
+}
+
+async function fetchModels() {
+  try {
+    cachedModels = await api('/models') || [];
+  } catch {
+    cachedModels = [];
+  }
+  return cachedModels;
+}
+
+let activeModelPickerTarget = null;
+
+function getModelEntries() {
+  const aliases = [
+    { id: 'opus', name: 'opus', family: 'aliases' },
+    { id: 'sonnet', name: 'sonnet', family: 'aliases' },
+    { id: 'haiku', name: 'haiku', family: 'aliases' },
+  ];
+  return [...cachedModels, ...aliases];
+}
+
+function renderModelPicker(query) {
+  const list = document.getElementById('model-picker-list');
+  const q = (query || '').toLowerCase().trim();
+  const all = getModelEntries();
+
+  const filtered = q
+    ? all.filter(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q) || (m.family || '').toLowerCase().includes(q))
+    : all;
+
+  const familyOrder = ['claude-opus', 'claude-sonnet', 'claude-haiku', 'claude-fable'];
+  const groups = new Map();
+  for (const m of filtered) {
+    const fam = m.family || 'other';
+    if (!groups.has(fam)) groups.set(fam, []);
+    groups.get(fam).push(m);
+  }
+
+  const ordered = familyOrder.filter(f => groups.has(f));
+  for (const fam of groups.keys()) {
+    if (!ordered.includes(fam)) ordered.push(fam);
+  }
+
+  const parts = [];
+  const emptyLabel = activeModelPickerTarget === 'session-model' ? 'Default' : 'None';
+  parts.push(`<button type="button" class="picker-item" data-model-id=""><div class="picker-item-main"><span class="picker-item-name">${emptyLabel}</span></div></button>`);
+
+  for (const fam of ordered) {
+    const label = fam === 'aliases' ? 'Aliases' : fam.replace('claude-', '').replace(/^./, c => c.toUpperCase());
+    parts.push(`<div class="picker-group-label">${esc(label)}</div>`);
+    for (const m of groups.get(fam)) {
+      const displayName = m.family === 'aliases' ? m.name : m.name.replace('Claude ', '');
+      parts.push(`<button type="button" class="picker-item" data-model-id="${esc(m.id)}">
+        <div class="picker-item-main">
+          <span class="picker-item-name">${esc(displayName)}</span>
+          ${m.family !== 'aliases' ? `<span class="picker-item-path">${esc(m.id)}</span>` : ''}
+        </div>
+      </button>`);
+    }
+  }
+
+  if (filtered.length === 0 && q) {
+    parts.push('<div class="picker-empty">No matches</div>');
+  }
+
+  parts.push('<button type="button" class="picker-item picker-item-custom" data-model-id="__custom__"><div class="picker-item-main"><span class="picker-item-name">Custom ID…</span></div></button>');
+
+  list.innerHTML = parts.join('');
+}
+
+function openModelPicker(target) {
+  activeModelPickerTarget = target;
+  const search = document.getElementById('model-picker-search');
+  search.value = '';
+  renderModelPicker('');
+  openModal('model-picker-modal');
+
+  const currentId = document.getElementById(target + '-hidden').value;
+  if (currentId && currentId !== '__custom__') {
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`#model-picker-list .picker-item[data-model-id="${CSS.escape(currentId)}"]`);
+      if (el) el.scrollIntoView({ block: 'center' });
+    });
+  }
+}
+
+function closeModelPicker() {
+  closeModal('model-picker-modal');
+  activeModelPickerTarget = null;
+}
+
+function selectModel(target, modelId) {
+  const valueEl = document.getElementById(target + '-value');
+  const hidden = document.getElementById(target + '-hidden');
+  const customInput = document.getElementById(target + '-custom');
+  const pickerEl = document.getElementById(target + '-picker');
+
+  if (modelId === '__custom__') {
+    valueEl.textContent = 'Custom…';
+    valueEl.classList.add('placeholder');
+    hidden.value = '__custom__';
+    customInput.style.display = '';
+    customInput.focus();
+    if (pickerEl) pickerEl.classList.remove('open');
+    return;
+  }
+
+  customInput.style.display = 'none';
+  customInput.value = '';
+
+  if (!modelId) {
+    const defaultLabel = target === 'session-model' ? 'Default' : 'None';
+    valueEl.textContent = defaultLabel;
+    valueEl.classList.add('placeholder');
+    hidden.value = '';
+    if (pickerEl) pickerEl.classList.remove('open');
+    return;
+  }
+
+  const entry = getModelEntries().find(m => m.id === modelId);
+  const displayName = entry ? (entry.family === 'aliases' ? entry.name : entry.name.replace('Claude ', '')) : modelId;
+  valueEl.textContent = displayName;
+  valueEl.classList.remove('placeholder');
+  hidden.value = modelId;
+  if (pickerEl) pickerEl.classList.remove('open');
+}
+
+function getModelValue(target) {
+  const hidden = document.getElementById(target + '-hidden');
+  if (hidden.value === '__custom__') {
+    return document.getElementById(target + '-custom').value;
+  }
+  return hidden.value;
+}
+
+function setModelFromValue(target, value) {
+  if (!value) {
+    selectModel(target, '');
+    return;
+  }
+  const entry = getModelEntries().find(m => m.id === value);
+  if (entry) {
+    selectModel(target, value);
+  } else {
+    selectModel(target, '__custom__');
+    document.getElementById(target + '-custom').value = value;
+  }
 }
 
 async function saveConfig(data) {
@@ -387,7 +691,7 @@ async function refreshBranchSelect(path) {
 
 function renderFavDirs() {
   const container = document.getElementById('fav-dirs');
-  container.innerHTML = (config.favoriteDirs || []).map(d =>
+  container.innerHTML = (settingsDraft.favoriteDirs || []).map(d =>
     `<div class="fav-item">
       <span>${esc(d)}</span>
       <button class="fav-remove" data-remove-fav="${esc(d)}">&times;</button>
@@ -397,7 +701,7 @@ function renderFavDirs() {
 
 function renderProjectRoots() {
   const container = document.getElementById('project-roots');
-  container.innerHTML = (config.projectRoots || []).map(d =>
+  container.innerHTML = (settingsDraft.projectRoots || []).map(d =>
     `<div class="fav-item">
       <span>${esc(d)}</span>
       <button class="fav-remove" data-remove-root="${esc(d)}">&times;</button>
@@ -407,12 +711,49 @@ function renderProjectRoots() {
 
 function renderPluginDirs() {
   const container = document.getElementById('plugin-dirs');
-  container.innerHTML = (config.pluginDirs || []).map(d =>
+  container.innerHTML = (settingsDraft.pluginDirs || []).map(d =>
     `<div class="fav-item">
       <span>${esc(d)}</span>
       <button class="fav-remove" data-remove-plugin-dir="${esc(d)}">&times;</button>
     </div>`
   ).join('');
+}
+
+function updatePermWarn() {
+  const v = document.getElementById('default-perm-mode').value;
+  document.getElementById('default-perm-warn').hidden = v !== 'bypassPermissions';
+}
+
+function openSettings() {
+  // Work on a clone so Cancel discards edits and list changes never look saved
+  // until Save actually persists them.
+  settingsDraft = {
+    favoriteDirs: [...(config.favoriteDirs || [])],
+    projectRoots: [...(config.projectRoots || [])],
+    pluginDirs: [...(config.pluginDirs || [])],
+  };
+  renderFavDirs();
+  renderProjectRoots();
+  renderPluginDirs();
+  document.getElementById('default-perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
+  updatePermWarn();
+  setModelFromValue('default-model', config.defaultModel || '');
+  document.getElementById('default-effort').value = config.defaultEffort || '';
+  document.getElementById('channels-enabled').checked = !!config.channelsEnabled;
+  document.getElementById('channels-config').style.display = config.channelsEnabled ? '' : 'none';
+  document.getElementById('default-channels').value = config.defaultChannels || '';
+  renderSecurity();
+  renderVersionLabels();
+  openModal('settings-modal');
+}
+
+function renderSecurity() {
+  const enabled = !!authStatus.enabled;
+  document.getElementById('auth-enabled').checked = enabled;
+  document.getElementById('auth-pw-label').textContent =
+    authStatus.hasPassword ? 'Change password' : 'Set a password';
+  document.getElementById('auth-new-password').value = '';
+  document.getElementById('logout-btn').style.display = enabled ? '' : 'none';
 }
 
 // --- Events ---
@@ -422,17 +763,52 @@ function bindEvents() {
     openNewModal();
   });
 
-  document.getElementById('settings-btn').addEventListener('click', () => {
-    renderFavDirs();
-    renderProjectRoots();
-    document.getElementById('default-perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
-    setModelSelect('default-model', 'default-model-custom', config.defaultModel || '');
-    document.getElementById('default-effort').value = config.defaultEffort || '';
-    document.getElementById('channels-enabled').checked = !!config.channelsEnabled;
-    document.getElementById('channels-config').style.display = config.channelsEnabled ? '' : 'none';
-    document.getElementById('default-channels').value = config.defaultChannels || '';
-    renderPluginDirs();
-    openModal('settings-modal');
+  document.getElementById('settings-btn').addEventListener('click', openSettings);
+
+  document.getElementById('default-perm-mode').addEventListener('change', updatePermWarn);
+
+  document.getElementById('auth-enabled').addEventListener('change', async (e) => {
+    const wantOn = e.target.checked;
+    if (wantOn && !authStatus.hasPassword) {
+      e.target.checked = false;
+      toast('Set a password first, then enable', true);
+      document.getElementById('auth-new-password').focus();
+      return;
+    }
+    try {
+      authStatus = await authReq('/auth/config', { enabled: wantOn }, 'PUT');
+      renderSecurity();
+      toast(wantOn ? 'Password protection on' : 'Password protection off');
+    } catch (err) {
+      e.target.checked = !wantOn;
+      toast(err.message, true);
+    }
+  });
+
+  document.getElementById('auth-save-password').addEventListener('click', async () => {
+    const input = document.getElementById('auth-new-password');
+    const pw = input.value;
+    if (pw.length < 6) { toast('Password must be at least 6 characters', true); return; }
+    try {
+      const body = { newPassword: pw };
+      if (!authStatus.enabled) body.enabled = true; // setting a password from off also turns it on
+      authStatus = await authReq('/auth/config', body, 'PUT');
+      input.value = '';
+      renderSecurity();
+      toast('Password updated');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    try {
+      await authReq('/auth/logout', {});
+      closeModal('settings-modal');
+      handleUnauthorized();
+    } catch (err) {
+      toast(err.message, true);
+    }
   });
 
   document.getElementById('sessions').addEventListener('click', (e) => {
@@ -501,7 +877,7 @@ function bindEvents() {
         name: form.name.value.trim(),
         dir: dir || config.defaultDir,
         permissionMode: form.permissionMode.value,
-        model: getModelValue('session-model', 'session-model-custom'),
+        model: getModelValue('session-model'),
         effort: form.effort.value,
         branch,
         createBranch,
@@ -564,14 +940,14 @@ function bindEvents() {
   document.getElementById('save-settings').addEventListener('click', async () => {
     try {
       await saveConfig({
-        favoriteDirs: config.favoriteDirs,
-        projectRoots: config.projectRoots || [],
+        favoriteDirs: settingsDraft.favoriteDirs,
+        projectRoots: settingsDraft.projectRoots,
         defaultPermissionMode: document.getElementById('default-perm-mode').value,
-        defaultModel: getModelValue('default-model', 'default-model-custom'),
+        defaultModel: getModelValue('default-model'),
         defaultEffort: document.getElementById('default-effort').value,
         channelsEnabled: document.getElementById('channels-enabled').checked,
         defaultChannels: document.getElementById('default-channels').value.trim(),
-        pluginDirs: config.pluginDirs || [],
+        pluginDirs: settingsDraft.pluginDirs,
       });
       closeModal('settings-modal');
       toast('Settings saved');
@@ -584,9 +960,9 @@ function bindEvents() {
     const input = document.getElementById('new-fav-dir');
     const val = input.value.trim();
     if (!val) return;
-    if (!config.favoriteDirs) config.favoriteDirs = [];
-    if (!config.favoriteDirs.includes(val)) {
-      config.favoriteDirs.push(val);
+    if (!settingsDraft.favoriteDirs) settingsDraft.favoriteDirs = [];
+    if (!settingsDraft.favoriteDirs.includes(val)) {
+      settingsDraft.favoriteDirs.push(val);
       renderFavDirs();
     }
     input.value = '';
@@ -596,9 +972,9 @@ function bindEvents() {
     const input = document.getElementById('new-project-root');
     const val = input.value.trim();
     if (!val) return;
-    if (!config.projectRoots) config.projectRoots = [];
-    if (!config.projectRoots.includes(val)) {
-      config.projectRoots.push(val);
+    if (!settingsDraft.projectRoots) settingsDraft.projectRoots = [];
+    if (!settingsDraft.projectRoots.includes(val)) {
+      settingsDraft.projectRoots.push(val);
       renderProjectRoots();
     }
     input.value = '';
@@ -607,7 +983,7 @@ function bindEvents() {
   document.getElementById('fav-dirs').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-remove-fav]');
     if (btn) {
-      config.favoriteDirs = config.favoriteDirs.filter(d => d !== btn.dataset.removeFav);
+      settingsDraft.favoriteDirs = (settingsDraft.favoriteDirs || []).filter(d => d !== btn.dataset.removeFav);
       renderFavDirs();
     }
   });
@@ -615,7 +991,7 @@ function bindEvents() {
   document.getElementById('project-roots').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-remove-root]');
     if (btn) {
-      config.projectRoots = (config.projectRoots || []).filter(d => d !== btn.dataset.removeRoot);
+      settingsDraft.projectRoots = (settingsDraft.projectRoots || []).filter(d => d !== btn.dataset.removeRoot);
       renderProjectRoots();
     }
   });
@@ -624,9 +1000,9 @@ function bindEvents() {
     const input = document.getElementById('new-plugin-dir');
     const val = input.value.trim();
     if (!val) return;
-    if (!config.pluginDirs) config.pluginDirs = [];
-    if (!config.pluginDirs.includes(val)) {
-      config.pluginDirs.push(val);
+    if (!settingsDraft.pluginDirs) settingsDraft.pluginDirs = [];
+    if (!settingsDraft.pluginDirs.includes(val)) {
+      settingsDraft.pluginDirs.push(val);
       renderPluginDirs();
     }
     input.value = '';
@@ -635,7 +1011,7 @@ function bindEvents() {
   document.getElementById('plugin-dirs').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-remove-plugin-dir]');
     if (btn) {
-      config.pluginDirs = (config.pluginDirs || []).filter(d => d !== btn.dataset.removePluginDir);
+      settingsDraft.pluginDirs = (settingsDraft.pluginDirs || []).filter(d => d !== btn.dataset.removePluginDir);
       renderPluginDirs();
     }
   });
@@ -644,16 +1020,24 @@ function bindEvents() {
     document.getElementById('channels-config').style.display = e.target.checked ? '' : 'none';
   });
 
-  document.getElementById('session-model').addEventListener('change', (e) => {
-    const custom = document.getElementById('session-model-custom');
-    if (e.target.value === '__custom__') { custom.style.display = ''; custom.focus(); }
-    else { custom.style.display = 'none'; custom.value = ''; }
+  document.getElementById('session-model-trigger').addEventListener('click', () => {
+    openModelPicker('session-model');
   });
 
-  document.getElementById('default-model').addEventListener('change', (e) => {
-    const custom = document.getElementById('default-model-custom');
-    if (e.target.value === '__custom__') { custom.style.display = ''; custom.focus(); }
-    else { custom.style.display = 'none'; custom.value = ''; }
+  document.getElementById('default-model-trigger').addEventListener('click', () => {
+    openModelPicker('default-model');
+  });
+
+  document.getElementById('model-picker-search').addEventListener('input', (e) => {
+    renderModelPicker(e.target.value);
+  });
+
+  document.getElementById('model-picker-list').addEventListener('click', (e) => {
+    const item = e.target.closest('.picker-item');
+    if (!item || !activeModelPickerTarget) return;
+    const modelId = item.dataset.modelId;
+    selectModel(activeModelPickerTarget, modelId);
+    closeModelPicker();
   });
 
   document.getElementById('open-login-btn').addEventListener('click', openLoginModal);
@@ -715,7 +1099,7 @@ function openNewModal() {
   const form = document.getElementById('new-form');
   form.reset();
   document.getElementById('perm-mode').value = config.defaultPermissionMode || 'bypassPermissions';
-  setModelSelect('session-model', 'session-model-custom', config.defaultModel || '');
+  setModelFromValue('session-model', config.defaultModel || '');
   document.getElementById('session-effort').value = config.defaultEffort || '';
   document.getElementById('session-dir').value = '';
   document.getElementById('session-dir').style.display = 'none';
@@ -885,28 +1269,6 @@ function shortenDir(dir) {
   return dir;
 }
 
-function setModelSelect(selectId, customId, value) {
-  const select = document.getElementById(selectId);
-  const custom = document.getElementById(customId);
-  const hasOption = Array.from(select.options).some(o => o.value === value);
-  if (value && !hasOption) {
-    select.value = '__custom__';
-    custom.value = value;
-    custom.style.display = '';
-  } else {
-    select.value = value || '';
-    custom.value = '';
-    custom.style.display = 'none';
-  }
-}
-
-function getModelValue(selectId, customId) {
-  const select = document.getElementById(selectId);
-  if (select.value === '__custom__') {
-    return document.getElementById(customId).value;
-  }
-  return select.value;
-}
 
 function esc(s) {
   if (!s) return '';

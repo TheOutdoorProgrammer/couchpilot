@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -156,9 +157,10 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 
 	sm.mu.Lock()
 	sm.sessions[s.ID] = s
+	snap := *s
 	sm.mu.Unlock()
 	sm.persist()
-	sm.hub.Broadcast(SSEEvent{Type: "session_created", Data: s})
+	sm.hub.Broadcast(SSEEvent{Type: "session_created", Data: &snap})
 
 	go sm.scanOutput(s, ptmx)
 	go sm.waitProcess(s)
@@ -185,7 +187,14 @@ func (sm *SessionManager) KillSession(id string) error {
 	if s.Status == StatusDead {
 		return nil
 	}
-	return syscall.Kill(s.PID, syscall.SIGTERM)
+	// pty starts each session in its own session/process group (Setsid), so a
+	// negative PID signals the whole group and reaps Claude's children (node,
+	// MCP servers, hooks) instead of orphaning them. Fall back to the bare PID
+	// if the group is already gone.
+	if err := syscall.Kill(-s.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return syscall.Kill(s.PID, syscall.SIGTERM)
+	}
+	return nil
 }
 
 func (sm *SessionManager) DismissSession(id string) {
@@ -213,26 +222,51 @@ func (sm *SessionManager) GetSessions() []*Session {
 	return result
 }
 
-var urlPattern = regexp.MustCompile(`https://claude\.ai\S*`)
+var urlPattern = regexp.MustCompile(`https://claude\.ai[^\s'")]*`)
 
+const scanTailMax = 8192
+
+// debugOutput gates per-chunk logging of session PTY output. Off by default —
+// the Claude TUI redraws constantly, so logging every chunk fills the disk.
+var debugOutput = os.Getenv("COUCHPILOT_DEBUG") != ""
+
+// scanOutput drains the session's PTY, looking for the claude.ai remote-control
+// URL. It must keep reading until EOF even after the URL is found, or the child
+// blocks on a full PTY buffer. Raw reads (not bufio.Scanner) avoid the 64 KB
+// token limit that a newline-less TUI redraw would trip.
 func (sm *SessionManager) scanOutput(s *Session, r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := stripANSI(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		log.Printf("[%s] %s", s.Name, line)
-		if url := urlPattern.FindString(line); url != "" {
-			sm.mu.Lock()
-			s.URL = url
-			if s.Status == StatusStarting {
-				s.Status = StatusActive
+	buf := make([]byte, 4096)
+	var tail []byte
+	urlFound := false
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			clean := stripANSI(string(buf[:n]))
+			if debugOutput && strings.TrimSpace(clean) != "" {
+				log.Printf("[%s] %s", s.Name, strings.TrimRight(clean, "\r\n"))
 			}
-			sm.mu.Unlock()
-			sm.persist()
-			sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: s})
+			if !urlFound && clean != "" {
+				tail = append(tail, clean...)
+				if len(tail) > scanTailMax {
+					tail = tail[len(tail)-scanTailMax:]
+				}
+				if url := urlPattern.FindString(string(tail)); url != "" {
+					urlFound = true
+					tail = nil
+					sm.mu.Lock()
+					s.URL = url
+					if s.Status == StatusStarting {
+						s.Status = StatusActive
+					}
+					snap := *s
+					sm.mu.Unlock()
+					sm.persist()
+					sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+				}
+			}
+		}
+		if err != nil {
+			return
 		}
 	}
 }
@@ -264,9 +298,10 @@ func (sm *SessionManager) markDead(id string) {
 	s.Status = StatusDead
 	s.DiedAt = &now
 	isChannels := s.IsChannels
+	snap := *s
 	sm.mu.Unlock()
 	sm.persist()
-	sm.hub.Broadcast(SSEEvent{Type: "session_died", Data: s})
+	sm.hub.Broadcast(SSEEvent{Type: "session_died", Data: &snap})
 
 	if isChannels && sm.onChannelsDied != nil {
 		go func() {
@@ -360,11 +395,17 @@ func (sm *SessionManager) loadFromDisk() ([]*Session, error) {
 
 func generateID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
 	return hex.EncodeToString(b)
 }
 
-var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07`)
+// ansiPattern strips CSI sequences (including `?`-prefixed private modes like
+// the cursor show/hide \x1b[?25h that the TUI emits constantly), OSC strings,
+// charset selectors, and stray C0 control bytes. Kept in sync with the
+// browser-side regex in app.js.
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[=>]|[\x00-\x08\x0b\x0c\x0e-\x1f]`)
 
 func stripANSI(s string) string {
 	return ansiPattern.ReplaceAllString(s, "")
@@ -383,7 +424,10 @@ var nouns = []string{
 }
 
 func generateName() string {
-	ai, _ := rand.Int(rand.Reader, big.NewInt(int64(len(adjectives))))
-	ni, _ := rand.Int(rand.Reader, big.NewInt(int64(len(nouns))))
+	ai, err1 := rand.Int(rand.Reader, big.NewInt(int64(len(adjectives))))
+	ni, err2 := rand.Int(rand.Reader, big.NewInt(int64(len(nouns))))
+	if err1 != nil || err2 != nil {
+		return fmt.Sprintf("session-%d", time.Now().Unix())
+	}
 	return fmt.Sprintf("%s-%s", adjectives[ai.Int64()], nouns[ni.Int64()])
 }

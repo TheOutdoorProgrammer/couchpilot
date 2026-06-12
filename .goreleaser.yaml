@@ -1,0 +1,71 @@
+# GoReleaser config — https://goreleaser.com
+# Release is driven by pushing a `vX.Y.Z` tag (see .github/workflows/release.yml).
+# The tag becomes the version, injected into the binary via -ldflags and shown
+# in the UI and `couchpilot version`.
+version: 2
+
+project_name: couchpilot
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: couchpilot
+    main: .
+    binary: couchpilot
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    # The web UI is embedded via go:embed, so each binary is fully self-contained.
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: couchpilot
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: TheOutdoorProgrammer
+    name: couchpilot
+  draft: false
+  prerelease: auto
+  header: |
+    ## couchpilot {{ .Tag }}
+
+    The ultimate mobile vibe-coding cockpit for Claude Code.
+
+    Download the binary for your platform below, or `go install github.com/TheOutdoorProgrammer/couchpilot@{{ .Tag }}`.

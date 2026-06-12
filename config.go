@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 )
 
 type Config struct {
 	Port                  int      `json:"port"`
+	Host                  string   `json:"host"`
 	DefaultDir            string   `json:"defaultDir"`
 	FavoriteDirs          []string `json:"favoriteDirs"`
 	ProjectRoots          []string `json:"projectRoots"`
@@ -17,6 +19,7 @@ type Config struct {
 	DefaultChannels       string   `json:"defaultChannels"`
 	PluginDirs            []string `json:"pluginDirs"`
 	ChannelsEnabled       bool     `json:"channelsEnabled"`
+	AuthEnabled           bool     `json:"authEnabled"`
 
 	configPath string
 }
@@ -31,6 +34,7 @@ func LoadConfig() (*Config, error) {
 		DefaultDir:            "~/",
 		FavoriteDirs:          []string{"~/"},
 		DefaultPermissionMode: "bypassPermissions",
+		AuthEnabled:           true,
 		configPath:            configPath,
 	}
 
@@ -41,7 +45,18 @@ func LoadConfig() (*Config, error) {
 		return cfg, nil
 	}
 
-	json.Unmarshal(data, cfg)
+	if err := json.Unmarshal(data, cfg); err != nil {
+		// A corrupt config shouldn't silently boot with half-applied defaults —
+		// surface it and keep the known-good defaults above.
+		log.Printf("config: %s is invalid (%v); using defaults", configPath, err)
+		cfg = &Config{
+			Port:                  7080,
+			DefaultDir:            "~/",
+			FavoriteDirs:          []string{"~/"},
+			DefaultPermissionMode: "bypassPermissions",
+			AuthEnabled:           true,
+		}
+	}
 	cfg.configPath = configPath
 	return cfg, nil
 }

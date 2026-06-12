@@ -10,6 +10,31 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div id="auth-gate" class="auth-gate" hidden>
+    <div class="auth-card">
+      <div class="auth-brand">couchpilot</div>
+      <div class="auth-version" id="auth-version"></div>
+
+      <form id="auth-login-form" class="auth-form" hidden>
+        <h2>Welcome back</h2>
+        <p class="subtle">Enter your password to continue.</p>
+        <input type="password" id="auth-login-password" placeholder="Password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="submit" class="btn btn-primary btn-full">Unlock</button>
+        <p class="auth-error" id="auth-login-error" hidden></p>
+      </form>
+
+      <form id="auth-setup-form" class="auth-form" hidden>
+        <h2>Set a password</h2>
+        <p class="subtle">couchpilot can launch agents that run code on this machine. Protect it with a password, or disable auth if this is a trusted private network.</p>
+        <input type="password" id="auth-setup-password" placeholder="New password (min 6 characters)" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <input type="password" id="auth-setup-confirm" placeholder="Confirm password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="submit" class="btn btn-primary btn-full">Set password &amp; continue</button>
+        <button type="button" id="auth-setup-disable" class="btn btn-ghost btn-full">Disable auth (trusted network)</button>
+        <p class="auth-error" id="auth-setup-error" hidden></p>
+      </form>
+    </div>
+  </div>
+
   <header>
     <h1>couchpilot</h1>
     <button id="settings-btn" class="icon-btn" aria-label="Settings">
@@ -78,28 +103,14 @@
           </select>
         </div>
         <div class="field">
-          <label for="session-model">Model</label>
-          <select id="session-model" name="model" class="select-field">
-            <option value="">Default</option>
-            <optgroup label="Latest">
-              <option value="claude-opus-4-8">Opus 4.8</option>
-              <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-              <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-            </optgroup>
-            <optgroup label="Previous">
-              <option value="claude-opus-4-7">Opus 4.7</option>
-              <option value="claude-opus-4-6">Opus 4.6</option>
-              <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
-              <option value="claude-opus-4-5-20251101">Opus 4.5</option>
-              <option value="claude-opus-4-1-20250805">Opus 4.1</option>
-            </optgroup>
-            <optgroup label="Aliases">
-              <option value="opus">opus</option>
-              <option value="sonnet">sonnet</option>
-              <option value="haiku">haiku</option>
-            </optgroup>
-            <option value="__custom__">Custom...</option>
-          </select>
+          <label>Model</label>
+          <div class="picker" id="session-model-picker">
+            <button type="button" class="picker-trigger" id="session-model-trigger">
+              <span class="picker-value placeholder" id="session-model-value">Default</span>
+              <span class="picker-chevron" aria-hidden="true">▾</span>
+            </button>
+          </div>
+          <input type="hidden" id="session-model-hidden" value="">
           <input type="text" id="session-model-custom" placeholder="Enter model ID..." autocomplete="off" style="display:none;margin-top:8px;">
         </div>
         <div class="field">
@@ -123,101 +134,129 @@
 
   <div id="settings-modal" class="modal">
     <div class="modal-backdrop"></div>
-    <div class="modal-sheet">
-      <div class="modal-handle"></div>
-      <h2>Settings</h2>
-      <div class="field">
-        <label>Claude Authentication</label>
-        <button type="button" id="open-login-btn" class="btn btn-secondary btn-full">Run claude login</button>
+    <div class="modal-sheet settings-sheet">
+      <div class="settings-head">
+        <div class="modal-handle"></div>
+        <h2>Settings</h2>
       </div>
-      <div class="field">
-        <label>Project Roots</label>
-        <p class="subtle" style="margin-bottom:6px;">Parent folders containing many projects. Their subdirectories appear in the directory picker.</p>
-        <div id="project-roots" class="fav-list"></div>
-        <div class="add-row">
-          <input type="text" id="new-project-root" placeholder="e.g. ~/Documents/Programming">
-          <button type="button" id="add-project-root-btn" class="btn btn-small">Add</button>
-        </div>
-      </div>
-      <div class="field">
-        <label>Favorite Directories</label>
-        <div id="fav-dirs" class="fav-list"></div>
-        <div class="add-row">
-          <input type="text" id="new-fav-dir" placeholder="Add directory path...">
-          <button type="button" id="add-fav-btn" class="btn btn-small">Add</button>
-        </div>
-      </div>
-      <div class="field">
-        <label for="default-perm-mode">Default Permission Mode</label>
-        <select id="default-perm-mode" class="select-field">
-          <option value="bypassPermissions">Bypass Permissions</option>
-          <option value="auto">Auto</option>
-          <option value="dontAsk">Don't Ask</option>
-          <option value="acceptEdits">Accept Edits</option>
-          <option value="plan">Plan</option>
-          <option value="default">Default</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="default-model">Default Model</label>
-        <select id="default-model" class="select-field">
-          <option value="">None</option>
-          <optgroup label="Latest">
-            <option value="claude-opus-4-8">Opus 4.8</option>
-            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-          </optgroup>
-          <optgroup label="Previous">
-            <option value="claude-opus-4-7">Opus 4.7</option>
-            <option value="claude-opus-4-6">Opus 4.6</option>
-            <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
-            <option value="claude-opus-4-5-20251101">Opus 4.5</option>
-            <option value="claude-opus-4-1-20250805">Opus 4.1</option>
-          </optgroup>
-          <optgroup label="Aliases">
-            <option value="opus">opus</option>
-            <option value="sonnet">sonnet</option>
-            <option value="haiku">haiku</option>
-          </optgroup>
-          <option value="__custom__">Custom...</option>
-        </select>
-        <input type="text" id="default-model-custom" placeholder="Enter model ID..." autocomplete="off" style="display:none;margin-top:8px;">
-      </div>
-      <div class="field">
-        <label for="default-effort">Default Effort</label>
-        <select id="default-effort" class="select-field">
-          <option value="">None</option>
-          <option value="max">Max</option>
-          <option value="xhigh">Extra High</option>
-          <option value="high">High</option>
-          <option value="medium">Medium</option>
-          <option value="low">Low</option>
-        </select>
-      </div>
-      <div class="field">
-        <label class="toggle-label">
-          <input type="checkbox" id="channels-enabled">
-          <span>Channels Session</span>
-        </label>
-        <p class="subtle" style="margin-bottom:6px;">Auto-start a dedicated "channels" session on boot. It stays running and auto-restarts if it dies.</p>
-      </div>
-      <div id="channels-config" style="display:none;">
-        <div class="field">
-          <label for="default-channels">Channel</label>
-          <input type="text" id="default-channels" placeholder="e.g. plugin:imessage@claude-plugins-official" autocomplete="off">
-        </div>
-        <div class="field">
-          <label>Plugin Directories</label>
-          <p class="subtle" style="margin-bottom:6px;">Local plugin directories loaded via --plugin-dir on the channels session.</p>
-          <div id="plugin-dirs" class="fav-list"></div>
-          <div class="add-row">
-            <input type="text" id="new-plugin-dir" placeholder="e.g. ~/projects/src/github.com/TheOutdoorProgrammer/claude-imessage">
-            <button type="button" id="add-plugin-dir-btn" class="btn btn-small">Add</button>
+
+      <div class="settings-body">
+        <section class="settings-section">
+          <h3 class="section-title">Session Defaults</h3>
+          <div class="field">
+            <label for="default-perm-mode">Permission Mode</label>
+            <select id="default-perm-mode" class="select-field">
+              <option value="bypassPermissions">Bypass Permissions</option>
+              <option value="auto">Auto</option>
+              <option value="dontAsk">Don't Ask</option>
+              <option value="acceptEdits">Accept Edits</option>
+              <option value="plan">Plan</option>
+              <option value="default">Default</option>
+            </select>
+            <p class="subtle field-warn" id="default-perm-warn" hidden>⚠️ Bypass skips every permission prompt — launched agents can run any command without asking.</p>
           </div>
-        </div>
+          <div class="field">
+            <label>Model</label>
+            <div class="picker" id="default-model-picker">
+              <button type="button" class="picker-trigger" id="default-model-trigger">
+                <span class="picker-value placeholder" id="default-model-value">None</span>
+                <span class="picker-chevron" aria-hidden="true">▾</span>
+              </button>
+            </div>
+            <input type="hidden" id="default-model-hidden" value="">
+            <input type="text" id="default-model-custom" placeholder="Enter model ID..." autocomplete="off" style="display:none;margin-top:8px;">
+          </div>
+          <div class="field">
+            <label for="default-effort">Effort</label>
+            <select id="default-effort" class="select-field">
+              <option value="">None</option>
+              <option value="max">Max</option>
+              <option value="xhigh">Extra High</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="section-title">Projects</h3>
+          <div class="field">
+            <label>Project Roots</label>
+            <p class="subtle" style="margin-bottom:6px;">Parent folders containing many projects. Their subdirectories appear in the directory picker.</p>
+            <div id="project-roots" class="fav-list"></div>
+            <div class="add-row">
+              <input type="text" id="new-project-root" placeholder="e.g. ~/Documents/Programming">
+              <button type="button" id="add-project-root-btn" class="btn btn-small">Add</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Favorite Directories</label>
+            <div id="fav-dirs" class="fav-list"></div>
+            <div class="add-row">
+              <input type="text" id="new-fav-dir" placeholder="Add directory path...">
+              <button type="button" id="add-fav-btn" class="btn btn-small">Add</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="section-title">Channels</h3>
+          <label class="toggle-field">
+            <span>Auto-start channels session</span>
+            <span class="toggle">
+              <input type="checkbox" id="channels-enabled">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+          <p class="subtle" style="margin-top:8px;">Keeps a dedicated channels session running on boot and auto-restarts it if it dies.</p>
+          <div id="channels-config" style="display:none;margin-top:14px;">
+            <div class="field">
+              <label for="default-channels">Channel</label>
+              <input type="text" id="default-channels" placeholder="e.g. plugin:imessage@theoutdoorprogrammer" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>Plugin Directories</label>
+              <p class="subtle" style="margin-bottom:6px;">Local plugin directories loaded via --plugin-dir on the channels session.</p>
+              <div id="plugin-dirs" class="fav-list"></div>
+              <div class="add-row">
+                <input type="text" id="new-plugin-dir" placeholder="e.g. ~/projects/src/github.com/TheOutdoorProgrammer/claude-imessage">
+                <button type="button" id="add-plugin-dir-btn" class="btn btn-small">Add</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="section-title">Security</h3>
+          <p class="subtle" style="margin-bottom:10px;">A password protects this web UI. Changes here apply immediately — not on Save.</p>
+          <label class="toggle-field">
+            <span>Require password</span>
+            <span class="toggle">
+              <input type="checkbox" id="auth-enabled">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+          <div class="field" id="auth-pw-field" style="margin-top:14px;">
+            <label for="auth-new-password" id="auth-pw-label">New password</label>
+            <div class="add-row">
+              <input type="password" id="auth-new-password" placeholder="At least 6 characters" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+              <button type="button" id="auth-save-password" class="btn btn-small">Set</button>
+            </div>
+          </div>
+          <button type="button" id="logout-btn" class="btn btn-secondary btn-full" style="display:none;margin-top:6px;">Log out</button>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="section-title">Claude Account</h3>
+          <button type="button" id="open-login-btn" class="btn btn-secondary btn-full">Run claude login</button>
+        </section>
+
+        <p class="settings-version" id="settings-version"></p>
       </div>
-      <div class="form-actions">
-        <button type="button" class="btn btn-ghost" data-dismiss="settings-modal">Close</button>
+
+      <div class="settings-foot">
+        <button type="button" class="btn btn-ghost" data-dismiss="settings-modal">Cancel</button>
         <button type="button" id="save-settings" class="btn btn-primary">Save</button>
       </div>
     </div>
@@ -232,6 +271,18 @@
         <button type="button" class="picker-close" data-dismiss="dir-picker-modal" aria-label="Close">&times;</button>
       </div>
       <div class="picker-list" id="dir-picker-list"></div>
+    </div>
+  </div>
+
+  <div id="model-picker-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-sheet picker-modal-sheet">
+      <div class="modal-handle"></div>
+      <div class="picker-modal-header">
+        <input type="text" class="picker-search" id="model-picker-search" placeholder="Search models…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <button type="button" class="picker-close" data-dismiss="model-picker-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="picker-list" id="model-picker-list"></div>
     </div>
   </div>
 

@@ -9,6 +9,25 @@ import (
 	"path/filepath"
 )
 
+// Build metadata, injected at release time via -ldflags by GoReleaser.
+// Defaults apply to `go build`/`go run` and local development.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+// VersionInfo is surfaced over the API and in the UI.
+type VersionInfo struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Date    string `json:"date"`
+}
+
+func versionInfo() VersionInfo {
+	return VersionInfo{Version: version, Commit: commit, Date: date}
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -17,6 +36,9 @@ func main() {
 			return
 		case "uninstall":
 			cmdUninstall()
+			return
+		case "version", "--version", "-v":
+			fmt.Printf("couchpilot %s (commit %s, built %s)\n", version, commit, date)
 			return
 		}
 	}
@@ -35,7 +57,11 @@ func main() {
 	hub := NewSSEHub()
 	sm := NewSessionManager(cfg.DataDir(), hub)
 	lm := NewLoginManager(hub)
-	srv := NewServer(cfg, sm, lm, hub)
+	am, err := NewAuthManager(cfg.DataDir())
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	srv := NewServer(cfg, sm, lm, hub, am)
 
 	log.Printf("couchpilot listening on http://localhost:%d", cfg.Port)
 	if err := srv.Start(); err != nil {

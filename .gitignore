@@ -1,3 +1,4 @@
 couchpilot
 *.log
 .DS_Store
+dist/

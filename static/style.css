@@ -10,6 +10,8 @@
   --green: #3fb950;
   --yellow: #d29922;
   --red: #f85149;
+  --blue: #58a6ff;
+  --text-primary: #e6edf3;
   --radius: 12px;
   --radius-sm: 8px;
 }
@@ -302,6 +304,12 @@ main {
   margin-bottom: 18px;
 }
 
+.subtle {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .field > label, .field > span {
   display: block;
   font-size: 13px;
@@ -310,23 +318,30 @@ main {
   margin-bottom: 8px;
 }
 
-.field input[type="text"] {
+.field input[type="text"],
+.field input[type="password"],
+.field input[type="email"] {
   width: 100%;
   padding: 12px 14px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
-  font-size: 15px;
+  /* 16px keeps iOS Safari from auto-zooming the viewport on focus. */
+  font-size: 16px;
   outline: none;
   transition: border-color 0.15s;
 }
 
-.field input[type="text"]:focus {
+.field input[type="text"]:focus,
+.field input[type="password"]:focus,
+.field input[type="email"]:focus {
   border-color: var(--accent);
 }
 
-.field input[type="text"]::placeholder {
+.field input[type="text"]::placeholder,
+.field input[type="password"]::placeholder,
+.field input[type="email"]::placeholder {
   color: var(--text-secondary);
   opacity: 0.6;
 }
@@ -338,7 +353,7 @@ main {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text);
-  font-size: 15px;
+  font-size: 16px;
   outline: none;
   transition: border-color 0.15s;
   appearance: none;
@@ -960,3 +975,152 @@ main {
 }
 
 .toast.error { border-color: var(--red); }
+
+/* Auth gate */
+
+.auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  padding-top: calc(24px + env(safe-area-inset-top));
+  background: var(--bg);
+}
+
+.auth-gate[hidden] { display: none; }
+
+.auth-card {
+  width: 100%;
+  max-width: 360px;
+}
+
+.auth-brand {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+.auth-version {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin-bottom: 28px;
+  min-height: 14px;
+}
+
+.settings-version {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  opacity: 0.7;
+  padding: 16px 0 4px;
+}
+
+.auth-form { display: flex; flex-direction: column; gap: 12px; }
+.auth-form[hidden] { display: none; }
+.auth-form h2 { font-size: 18px; font-weight: 700; }
+.auth-form .subtle { font-size: 13px; line-height: 1.5; color: var(--text-secondary); margin-bottom: 4px; }
+
+.auth-form input {
+  width: 100%;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 16px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.auth-form input:focus { border-color: var(--accent); }
+.auth-form .btn { margin-top: 4px; }
+
+.auth-error {
+  color: var(--red);
+  font-size: 13px;
+  text-align: center;
+  margin-top: 4px;
+}
+
+.auth-error[hidden] { display: none; }
+
+/* Settings — sectioned, full-height on mobile with sticky header/footer */
+
+.settings-sheet {
+  display: flex;
+  flex-direction: column;
+  height: 92dvh;
+  max-height: 92dvh;
+  overflow: hidden;
+  padding: 0 24px;
+}
+
+.settings-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface);
+  padding-top: 8px;
+}
+
+.settings-head h2 { margin-bottom: 12px; }
+
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+.settings-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 0;
+  padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.settings-section {
+  padding: 18px 0;
+  border-top: 1px solid var(--border);
+}
+
+.settings-section:first-child {
+  border-top: none;
+  padding-top: 6px;
+}
+
+.section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin-bottom: 14px;
+}
+
+.field-warn {
+  margin-top: 8px;
+  color: var(--yellow);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.field-warn[hidden] { display: none; }
+
+@media (min-width: 640px) {
+  .settings-sheet {
+    height: auto;
+    max-height: calc(100vh - 48px);
+  }
+}

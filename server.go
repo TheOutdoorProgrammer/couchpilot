@@ -7,7 +7,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed static
@@ -53,20 +56,42 @@ func (h *SSEHub) Broadcast(event SSEEvent) {
 }
 
 type Server struct {
-	cfg *Config
-	sm  *SessionManager
-	lm  *LoginManager
-	hub *SSEHub
+	cfg   *Config
+	cfgMu sync.RWMutex
+	sm    *SessionManager
+	lm    *LoginManager
+	hub   *SSEHub
+	am    *AuthManager
 }
 
-func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub) *Server {
-	srv := &Server{cfg: cfg, sm: sm, lm: lm, hub: hub}
+func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub, am *AuthManager) *Server {
+	srv := &Server{cfg: cfg, sm: sm, lm: lm, hub: hub, am: am}
 
 	sm.onChannelsDied = func() {
 		srv.ensureChannelsSession()
 	}
 
 	return srv
+}
+
+// cfgSnapshot returns a consistent copy of the config for concurrent readers.
+// Config carries no embedded lock, so the value copy is vet-clean; writers
+// replace slices wholesale (never mutate in place), so sharing the slice
+// backing arrays in the snapshot is safe.
+func (s *Server) cfgSnapshot() Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return *s.cfg
+}
+
+// updateConfig mutates the config under the write lock and persists it. The
+// mutate callback runs while the lock is held, so it must not do anything slow
+// (no spawning sessions) — do that after updateConfig returns.
+func (s *Server) updateConfig(mutate func(*Config)) error {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	mutate(s.cfg)
+	return s.cfg.Save()
 }
 
 func (s *Server) Start() error {
@@ -94,16 +119,185 @@ func (s *Server) Start() error {
 	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("GET /api/branches", s.handleListBranches)
+	mux.HandleFunc("GET /api/models", s.handleListModels)
+	mux.HandleFunc("GET /api/version", s.handleVersion)
 	mux.HandleFunc("GET /api/login", s.handleLoginState)
 	mux.HandleFunc("POST /api/login", s.handleLoginStart)
 	mux.HandleFunc("POST /api/login/input", s.handleLoginInput)
 	mux.HandleFunc("DELETE /api/login", s.handleLoginStop)
 
-	return http.ListenAndServe(fmt.Sprintf(":%d", s.cfg.Port), mux)
+	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
+	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("PUT /api/auth/config", s.handleAuthConfig)
+
+	cfg := s.cfgSnapshot()
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	return http.ListenAndServe(addr, s.authMiddleware(mux))
+}
+
+// authMiddleware enforces password auth (when enabled) and blocks cross-origin
+// state-changing requests as CSRF defense-in-depth. Static assets and the
+// unauthenticated auth endpoints (status/login/setup) always pass through.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+				httpError(w, "cross-origin request blocked", http.StatusForbidden)
+				return
+			}
+		}
+		if s.cfgSnapshot().AuthEnabled && authRequired(r.URL.Path) && !s.am.requestAuthed(r) {
+			httpError(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authRequired(path string) bool {
+	if !strings.HasPrefix(path, "/api/") {
+		return false // static assets must load so the login page can render
+	}
+	switch path {
+	case "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/version":
+		return false
+	}
+	return true
+}
+
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == host
+}
+
+func (s *Server) authStatus(r *http.Request) map[string]bool {
+	enabled := s.cfgSnapshot().AuthEnabled
+	hasPassword := s.am.HasPassword()
+	return map[string]bool{
+		"enabled":     enabled,
+		"hasPassword": hasPassword,
+		"needsSetup":  enabled && !hasPassword,
+		"authed":      !enabled || s.am.requestAuthed(r),
+	}
+}
+
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.authStatus(r))
+}
+
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.cfgSnapshot().AuthEnabled {
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if !s.am.HasPassword() {
+		httpError(w, "no password set", http.StatusConflict)
+		return
+	}
+	if !s.am.CheckPassword(req.Password) {
+		httpError(w, "incorrect password", http.StatusUnauthorized)
+		return
+	}
+	s.setSessionCookie(w)
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if !s.cfgSnapshot().AuthEnabled {
+		httpError(w, "auth is disabled", http.StatusBadRequest)
+		return
+	}
+	if s.am.HasPassword() {
+		httpError(w, "password already set", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+		Disable  bool   `json:"disable"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	// This endpoint is only reachable in the first-run window (auth enabled, no
+	// password). A local user could set their own password here, so letting them
+	// instead opt out for a trusted network carries no extra risk.
+	if req.Disable {
+		if err := s.updateConfig(func(c *Config) { c.AuthEnabled = false }); err != nil {
+			httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
+	if err := s.am.SetPassword(req.Password); err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.setSessionCookie(w)
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, s.am.tokenCookie("", -1))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAuthConfig changes security settings. It sits behind the middleware, so
+// when auth is enabled only an authenticated user can reach it.
+func (s *Server) handleAuthConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled     *bool   `json:"enabled"`
+		NewPassword *string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.NewPassword != nil {
+		if err := s.am.SetPassword(*req.NewPassword); err != nil {
+			httpError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.setSessionCookie(w) // keep the caller logged in after a password change
+	}
+
+	if req.Enabled != nil {
+		// Refuse to enable auth with no password — it would lock the UI into
+		// first-run setup. The client must send newPassword in the same call.
+		if *req.Enabled && !s.am.HasPassword() {
+			httpError(w, "set a password before enabling auth", http.StatusBadRequest)
+			return
+		}
+		if err := s.updateConfig(func(c *Config) { c.AuthEnabled = *req.Enabled }); err != nil {
+			httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	writeJSON(w, s.authStatus(r))
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, s.am.tokenCookie(s.am.issueToken(tokenTTL), int(tokenTTL/time.Second)))
 }
 
 func (s *Server) ensureChannelsSession() {
-	if !s.cfg.ChannelsEnabled || s.cfg.DefaultChannels == "" {
+	cfg := s.cfgSnapshot()
+	if !cfg.ChannelsEnabled || cfg.DefaultChannels == "" {
 		return
 	}
 
@@ -126,14 +320,15 @@ func (s *Server) dismissDeadChannelsSessions() {
 }
 
 func (s *Server) startChannelsSession() {
+	cfg := s.cfgSnapshot()
 	session, err := s.sm.CreateSession(CreateSessionOpts{
 		Name:       "channels",
-		Dir:        s.cfg.DefaultDir,
-		PermMode:   s.cfg.DefaultPermissionMode,
-		Model:      s.cfg.DefaultModel,
-		Effort:     s.cfg.DefaultEffort,
-		Channels:   s.cfg.DefaultChannels,
-		PluginDirs: s.cfg.PluginDirs,
+		Dir:        cfg.DefaultDir,
+		PermMode:   cfg.DefaultPermissionMode,
+		Model:      cfg.DefaultModel,
+		Effort:     cfg.DefaultEffort,
+		Channels:   cfg.DefaultChannels,
+		PluginDirs: cfg.PluginDirs,
 		IsChannels: true,
 	})
 	if err != nil {
@@ -171,24 +366,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cfg := s.cfgSnapshot()
+
 	dir := req.Dir
 	if dir == "" {
-		dir = s.cfg.DefaultDir
+		dir = cfg.DefaultDir
 	}
 
 	permMode := req.PermissionMode
 	if permMode == "" {
-		permMode = s.cfg.DefaultPermissionMode
+		permMode = cfg.DefaultPermissionMode
 	}
 
 	model := req.Model
 	if model == "" {
-		model = s.cfg.DefaultModel
+		model = cfg.DefaultModel
 	}
 
 	effort := req.Effort
 	if effort == "" {
-		effort = s.cfg.DefaultEffort
+		effort = cfg.DefaultEffort
 	}
 
 	session, err := s.sm.CreateSession(CreateSessionOpts{
@@ -214,11 +411,12 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	type job struct {
 		path, group string
 	}
+	cfg := s.cfgSnapshot()
 	var jobs []job
-	for _, p := range s.cfg.FavoriteDirs {
+	for _, p := range cfg.FavoriteDirs {
 		jobs = append(jobs, job{p, "Favorites"})
 	}
-	for _, root := range s.cfg.ProjectRoots {
+	for _, root := range cfg.ProjectRoots {
 		for _, child := range ListSubdirs(root) {
 			jobs = append(jobs, job{child, root})
 		}
@@ -277,7 +475,7 @@ func (s *Server) handleDismissSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestartChannels(w http.ResponseWriter, r *http.Request) {
-	if !s.cfg.ChannelsEnabled {
+	if !s.cfgSnapshot().ChannelsEnabled {
 		httpError(w, "channels not enabled", http.StatusBadRequest)
 		return
 	}
@@ -361,7 +559,8 @@ func (s *Server) handleLoginStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.cfg)
+	cfg := s.cfgSnapshot()
+	writeJSON(w, &cfg)
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -381,42 +580,52 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if incoming.DefaultDir != nil {
-		s.cfg.DefaultDir = *incoming.DefaultDir
-	}
-	if incoming.FavoriteDirs != nil {
-		s.cfg.FavoriteDirs = incoming.FavoriteDirs
-	}
-	if incoming.ProjectRoots != nil {
-		s.cfg.ProjectRoots = incoming.ProjectRoots
-	}
-	if incoming.DefaultPermissionMode != nil {
-		s.cfg.DefaultPermissionMode = *incoming.DefaultPermissionMode
-	}
-	if incoming.DefaultModel != nil {
-		s.cfg.DefaultModel = *incoming.DefaultModel
-	}
-	if incoming.DefaultEffort != nil {
-		s.cfg.DefaultEffort = *incoming.DefaultEffort
-	}
-	if incoming.DefaultChannels != nil {
-		s.cfg.DefaultChannels = *incoming.DefaultChannels
-	}
-	if incoming.PluginDirs != nil {
-		s.cfg.PluginDirs = incoming.PluginDirs
-	}
-	if incoming.ChannelsEnabled != nil {
-		s.cfg.ChannelsEnabled = *incoming.ChannelsEnabled
-	}
-
-	if err := s.cfg.Save(); err != nil {
+	err := s.updateConfig(func(c *Config) {
+		if incoming.DefaultDir != nil {
+			c.DefaultDir = *incoming.DefaultDir
+		}
+		if incoming.FavoriteDirs != nil {
+			c.FavoriteDirs = incoming.FavoriteDirs
+		}
+		if incoming.ProjectRoots != nil {
+			c.ProjectRoots = incoming.ProjectRoots
+		}
+		if incoming.DefaultPermissionMode != nil {
+			c.DefaultPermissionMode = *incoming.DefaultPermissionMode
+		}
+		if incoming.DefaultModel != nil {
+			c.DefaultModel = *incoming.DefaultModel
+		}
+		if incoming.DefaultEffort != nil {
+			c.DefaultEffort = *incoming.DefaultEffort
+		}
+		if incoming.DefaultChannels != nil {
+			c.DefaultChannels = *incoming.DefaultChannels
+		}
+		if incoming.PluginDirs != nil {
+			c.PluginDirs = incoming.PluginDirs
+		}
+		if incoming.ChannelsEnabled != nil {
+			c.ChannelsEnabled = *incoming.ChannelsEnabled
+		}
+	})
+	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	s.ensureChannelsSession()
 
-	writeJSON(w, s.cfg)
+	cfg := s.cfgSnapshot()
+	writeJSON(w, &cfg)
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, versionInfo())
+}
+
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, models.Get())
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
