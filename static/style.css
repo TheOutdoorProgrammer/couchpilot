@@ -454,6 +454,7 @@ main {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   padding: 10px 14px;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -461,6 +462,11 @@ main {
   margin-bottom: 6px;
   font-size: 14px;
   color: var(--text-secondary);
+}
+
+.fav-item span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .fav-remove {
@@ -481,7 +487,7 @@ main {
   gap: 8px;
 }
 
-.add-row input { flex: 1; }
+.add-row input { flex: 1; min-width: 0; }
 
 /* Buttons */
 
@@ -1090,6 +1096,7 @@ main {
 .settings-body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
 }
