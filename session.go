@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"os"
@@ -19,8 +18,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/creack/pty"
 )
 
 type SessionStatus string
@@ -31,19 +28,32 @@ const (
 	StatusDead     SessionStatus = "dead"
 )
 
+// deadRetention is how long dead sessions stay visible (and resumable) in the
+// UI, both across restarts and in the periodic cleanup.
+const deadRetention = 24 * time.Hour
+
 type Session struct {
 	ID             string        `json:"id"`
 	Name           string        `json:"name"`
 	Dir            string        `json:"dir"`
-	PID            int           `json:"pid"`
+	PID            int           `json:"pid"` // claude's pid, reported by the shim
+	ShimPID        int           `json:"shimPid,omitempty"`
+	SessionUUID    string        `json:"sessionUuid,omitempty"` // claude conversation id; the --resume handle
 	URL            string        `json:"url"`
 	Status         SessionStatus `json:"status"`
 	PermissionMode string        `json:"permissionMode"`
+	Model          string        `json:"model,omitempty"`
+	Effort         string        `json:"effort,omitempty"`
+	Channels       string        `json:"channels,omitempty"`
+	PluginDirs     []string      `json:"pluginDirs,omitempty"`
 	IsChannels     bool          `json:"isChannels"`
+	Discard        bool          `json:"discard,omitempty"` // deliberately restarted: don't auto-resume
 	CreatedAt      time.Time     `json:"createdAt"`
 	DiedAt         *time.Time    `json:"diedAt,omitempty"`
 
-	cmd *exec.Cmd `json:"-"`
+	// gen increments on every (re)spawn; a watcher goroutine exits when the
+	// session moves to a generation it doesn't own (e.g. a resume raced it).
+	gen int
 }
 
 type SessionManager struct {
@@ -65,6 +75,10 @@ func NewSessionManager(dataDir string, hub *SSEHub) *SessionManager {
 	return sm
 }
 
+func (sm *SessionManager) stateDir(id string) string {
+	return filepath.Join(sm.dataDir, "sessions", id)
+}
+
 type CreateSessionOpts struct {
 	Name         string
 	Dir          string
@@ -80,11 +94,6 @@ type CreateSessionOpts struct {
 }
 
 func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error) {
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return nil, err
-	}
-
 	dir := opts.Dir
 	if strings.HasPrefix(dir, "~/") {
 		home, _ := os.UserHomeDir()
@@ -112,89 +121,280 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 		InvalidateProjectCache(opts.Dir)
 	}
 
-	permMode := opts.PermMode
-	model := opts.Model
-	effort := opts.Effort
-
-	args := []string{"--remote-control", name}
-	if permMode == "bypassPermissions" {
-		args = append(args, "--dangerously-skip-permissions")
-	} else if permMode != "" && permMode != "default" {
-		args = append(args, "--permission-mode", permMode)
-	}
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	if effort != "" {
-		args = append(args, "--effort", effort)
-	}
-	if opts.Channels != "" {
-		args = append(args, "--channels", opts.Channels)
-	}
-	for _, pd := range opts.PluginDirs {
-		args = append(args, "--plugin-dir", pd)
-	}
-
-	cmd := exec.Command(claudePath, args...)
-	cmd.Dir = dir
-
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		return nil, err
-	}
-
 	s := &Session{
 		ID:             generateID(),
 		Name:           name,
 		Dir:            dir,
-		PID:            cmd.Process.Pid,
+		SessionUUID:    generateUUID(),
 		Status:         StatusStarting,
-		PermissionMode: permMode,
+		PermissionMode: opts.PermMode,
+		Model:          opts.Model,
+		Effort:         opts.Effort,
+		Channels:       opts.Channels,
+		PluginDirs:     opts.PluginDirs,
 		IsChannels:     opts.IsChannels,
 		CreatedAt:      time.Now(),
-		cmd:            cmd,
+	}
+	// The RC TUI no longer prints its URL, but it is deterministic from the
+	// conversation id we just picked. The shim overrides this if an older
+	// claude does print one.
+	s.URL = "https://claude.ai/code/" + s.SessionUUID
+
+	if err := sm.spawnShim(s, false); err != nil {
+		return nil, err
 	}
 
 	sm.mu.Lock()
 	sm.sessions[s.ID] = s
 	snap := *s
+	gen := s.gen
 	sm.mu.Unlock()
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_created", Data: &snap})
 
-	go sm.scanOutput(s, ptmx)
-	go sm.waitProcess(s)
-
-	if permMode == "bypassPermissions" {
-		go func() {
-			time.Sleep(1 * time.Second)
-			ptmx.Write([]byte("\x1b[B"))
-			time.Sleep(200 * time.Millisecond)
-			ptmx.Write([]byte("\r"))
-		}()
-	}
+	go sm.watchSession(s, gen)
 
 	return s, nil
+}
+
+// ResumeSession relaunches a dead session's claude process with --resume, so
+// the conversation continues where it left off (and re-registers with Remote
+// Control under the same name).
+func (sm *SessionManager) ResumeSession(id string) (*Session, error) {
+	sm.mu.Lock()
+	s, ok := sm.sessions[id]
+	if !ok {
+		sm.mu.Unlock()
+		return nil, os.ErrNotExist
+	}
+	if s.Status != StatusDead {
+		sm.mu.Unlock()
+		return nil, errors.New("session is still running")
+	}
+	if s.SessionUUID == "" {
+		sm.mu.Unlock()
+		return nil, errors.New("session predates resume support — no conversation id recorded")
+	}
+	if !sessionFileExists(s.SessionUUID) {
+		sm.mu.Unlock()
+		return nil, errors.New("no saved conversation to resume — the session never exchanged a message")
+	}
+	s.Status = StatusStarting
+	s.DiedAt = nil
+	s.Discard = false
+	s.PID = 0
+	s.ShimPID = 0
+	s.gen++
+	sm.mu.Unlock()
+
+	if err := sm.spawnShim(s, true); err != nil {
+		sm.markDead(s.ID)
+		return nil, err
+	}
+
+	sm.mu.RLock()
+	snap := *s
+	gen := s.gen
+	sm.mu.RUnlock()
+	sm.persist()
+	sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+
+	go sm.watchSession(s, gen)
+
+	return &snap, nil
+}
+
+// spawnShim launches the detached shim that owns the session's PTY. The shim
+// is setsid'd into its own session, so couchpilot restarts don't touch it —
+// that's the whole point: claude survives couchpilot.
+func (sm *SessionManager) spawnShim(s *Session, resume bool) error {
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	stateDir := sm.stateDir(s.ID)
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return err
+	}
+	// Stale state from a previous run of this session would race the watcher.
+	os.Remove(filepath.Join(stateDir, shimStateFile))
+	os.Remove(filepath.Join(stateDir, shimTailFile))
+
+	args := []string{"_shim", "-state", stateDir}
+	if s.PermissionMode == "bypassPermissions" {
+		args = append(args, "-accept-bypass")
+	}
+	args = append(args, "--", claudePath)
+	args = append(args, buildClaudeArgs(s, resume)...)
+
+	cmd := exec.Command(self, args...)
+	cmd.Dir = s.Dir
+	logf, err := os.OpenFile(filepath.Join(stateDir, shimLogFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		defer logf.Close()
+		cmd.Stdout = logf
+		cmd.Stderr = logf
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go cmd.Wait() // reap only; lifecycle is tracked via state file + pid polls
+
+	sm.mu.Lock()
+	s.ShimPID = cmd.Process.Pid
+	sm.mu.Unlock()
+	return nil
+}
+
+func buildClaudeArgs(s *Session, resume bool) []string {
+	args := []string{"--remote-control", s.Name}
+	if resume {
+		args = append(args, "--resume", s.SessionUUID)
+	} else {
+		args = append(args, "--session-id", s.SessionUUID)
+	}
+	if s.PermissionMode == "bypassPermissions" {
+		args = append(args, "--dangerously-skip-permissions")
+	} else if s.PermissionMode != "" && s.PermissionMode != "default" {
+		args = append(args, "--permission-mode", s.PermissionMode)
+	}
+	if s.Model != "" {
+		args = append(args, "--model", s.Model)
+	}
+	if s.Effort != "" {
+		args = append(args, "--effort", s.Effort)
+	}
+	if s.Channels != "" {
+		args = append(args, "--channels", s.Channels)
+	}
+	for _, pd := range s.PluginDirs {
+		args = append(args, "--plugin-dir", pd)
+	}
+	return args
+}
+
+// watchSession follows a session through its shim's state file and pid. It is
+// the only status-transition driver for shim-backed sessions, both freshly
+// spawned and re-adopted after a couchpilot restart.
+func (sm *SessionManager) watchSession(s *Session, gen int) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	bridgeDone := false
+	tick := 0
+	for range ticker.C {
+		tick++
+		sm.mu.RLock()
+		id, shimPID, status, curGen := s.ID, s.ShimPID, s.Status, s.gen
+		sm.mu.RUnlock()
+		if curGen != gen || status == StatusDead {
+			return // a resume superseded this watcher, or the session was dismissed
+		}
+
+		// Once active, swap the synthesized URL for the canonical one from
+		// claude's own session file. The file (or its bridge line) can appear
+		// well after activation — first message for an idle session — so keep
+		// trying on a slow cadence until it lands.
+		if !bridgeDone && status == StatusActive && tick%5 == 0 {
+			sm.mu.RLock()
+			uuid := s.SessionUUID
+			sm.mu.RUnlock()
+			if uuid == "" {
+				bridgeDone = true
+			} else if u := bridgeURL(uuid); u != "" {
+				bridgeDone = true
+				sm.mu.Lock()
+				changed := s.URL != u
+				s.URL = u
+				snap := *s
+				sm.mu.Unlock()
+				if changed {
+					sm.persist()
+					sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+				}
+			}
+		}
+
+		st, err := readShimState(sm.stateDir(id))
+		if err == nil {
+			if st.Phase == ShimExited {
+				sm.markDead(id)
+				return
+			}
+			changed := false
+			sm.mu.Lock()
+			if st.ClaudePID != 0 && s.PID != st.ClaudePID {
+				s.PID = st.ClaudePID
+				changed = true
+			}
+			if st.URL != "" && s.URL != st.URL {
+				s.URL = st.URL
+				changed = true
+			}
+			if st.Phase == ShimActive && s.Status == StatusStarting {
+				s.Status = StatusActive
+				changed = true
+			}
+			snap := *s
+			sm.mu.Unlock()
+			if changed {
+				sm.persist()
+				sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+			}
+		}
+
+		if !pidAlive(shimPID) {
+			sm.markDead(id)
+			return
+		}
+	}
 }
 
 func (sm *SessionManager) KillSession(id string) error {
 	sm.mu.RLock()
 	s, ok := sm.sessions[id]
+	var shimPID, claudePID int
+	var status SessionStatus
+	if ok {
+		shimPID, claudePID, status = s.ShimPID, s.PID, s.Status
+	}
 	sm.mu.RUnlock()
 	if !ok {
 		return os.ErrNotExist
 	}
-	if s.Status == StatusDead {
+	if status == StatusDead {
 		return nil
 	}
-	// pty starts each session in its own session/process group (Setsid), so a
-	// negative PID signals the whole group and reaps Claude's children (node,
-	// MCP servers, hooks) instead of orphaning them. Fall back to the bare PID
-	// if the group is already gone.
-	if err := syscall.Kill(-s.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return syscall.Kill(s.PID, syscall.SIGTERM)
+	// Normal path: ask the shim, which forwards SIGTERM to claude's process
+	// group and reaps it.
+	if shimPID > 0 && pidAlive(shimPID) {
+		return syscall.Kill(shimPID, syscall.SIGTERM)
+	}
+	// Fallback (legacy pre-shim session, or the shim crashed): signal claude's
+	// process group directly so its children (node, MCP servers) die too.
+	if claudePID > 0 {
+		if err := syscall.Kill(-claudePID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return syscall.Kill(claudePID, syscall.SIGTERM)
+		}
 	}
 	return nil
+}
+
+// SetDiscard marks a session as deliberately retired: when it dies, automatic
+// recovery (channels auto-resume) must not bring its conversation back.
+func (sm *SessionManager) SetDiscard(id string) {
+	sm.mu.Lock()
+	if s, ok := sm.sessions[id]; ok {
+		s.Discard = true
+	}
+	sm.mu.Unlock()
+	sm.persist()
 }
 
 func (sm *SessionManager) DismissSession(id string) {
@@ -202,8 +402,13 @@ func (sm *SessionManager) DismissSession(id string) {
 	s, ok := sm.sessions[id]
 	if ok && s.Status == StatusDead {
 		delete(sm.sessions, id)
+	} else {
+		ok = false
 	}
 	sm.mu.Unlock()
+	if ok {
+		os.RemoveAll(sm.stateDir(id))
+	}
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_dismissed", Data: map[string]string{"id": id}})
 }
@@ -220,71 +425,6 @@ func (sm *SessionManager) GetSessions() []*Session {
 		return result[i].CreatedAt.After(result[j].CreatedAt)
 	})
 	return result
-}
-
-var urlPattern = regexp.MustCompile(`https://claude\.ai[^\s'")]*`)
-
-const scanTailMax = 8192
-
-// debugOutput gates per-chunk logging of session PTY output. Off by default —
-// the Claude TUI redraws constantly, so logging every chunk fills the disk.
-var debugOutput = os.Getenv("COUCHPILOT_DEBUG") != ""
-
-// scanOutput drains the session's PTY, looking for the claude.ai remote-control
-// URL. It must keep reading until EOF even after the URL is found, or the child
-// blocks on a full PTY buffer. Raw reads (not bufio.Scanner) avoid the 64 KB
-// token limit that a newline-less TUI redraw would trip.
-func (sm *SessionManager) scanOutput(s *Session, r io.Reader) {
-	buf := make([]byte, 4096)
-	var tail []byte
-	urlFound := false
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			clean := stripANSI(string(buf[:n]))
-			if debugOutput && strings.TrimSpace(clean) != "" {
-				log.Printf("[%s] %s", s.Name, strings.TrimRight(clean, "\r\n"))
-			}
-			if !urlFound && clean != "" {
-				tail = append(tail, clean...)
-				if len(tail) > scanTailMax {
-					tail = tail[len(tail)-scanTailMax:]
-				}
-				if url := urlPattern.FindString(string(tail)); url != "" {
-					urlFound = true
-					tail = nil
-					sm.mu.Lock()
-					s.URL = url
-					if s.Status == StatusStarting {
-						s.Status = StatusActive
-					}
-					snap := *s
-					sm.mu.Unlock()
-					sm.persist()
-					sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (sm *SessionManager) waitProcess(s *Session) {
-	if s.cmd == nil {
-		return
-	}
-	err := s.cmd.Wait()
-	log.Printf("[%s] process exited: %v", s.Name, err)
-
-	sm.mu.Lock()
-	if s.Status == StatusStarting {
-		s.Status = StatusActive
-	}
-	sm.mu.Unlock()
-
-	sm.markDead(s.ID)
 }
 
 func (sm *SessionManager) markDead(id string) {
@@ -311,41 +451,69 @@ func (sm *SessionManager) markDead(id string) {
 	}
 }
 
+// recover re-adopts sessions after a couchpilot restart. Shim-backed sessions
+// whose shim is still running are picked up live — this is what makes
+// couchpilot restarts invisible to sessions. Everything else is marked dead
+// (and stays resumable when it has a conversation id).
 func (sm *SessionManager) recover() {
 	sessions, err := sm.loadFromDisk()
 	if err != nil {
 		return
 	}
 
+	now := time.Now()
 	for _, s := range sessions {
 		if s.Status == StatusDead {
-			if s.DiedAt != nil && time.Since(*s.DiedAt) < time.Hour {
+			if s.DiedAt != nil && time.Since(*s.DiedAt) < deadRetention {
 				sm.sessions[s.ID] = s
 			}
 			continue
 		}
 
-		if err := syscall.Kill(s.PID, 0); err != nil {
-			now := time.Now()
+		sm.sessions[s.ID] = s
+
+		if s.ShimPID > 0 {
+			st, stErr := readShimState(sm.stateDir(s.ID))
+			shimRunning := pidAlive(s.ShimPID) && pidCommandContains(s.ShimPID, "couchpilot")
+			if shimRunning && (stErr != nil || st.Phase != ShimExited) {
+				if stErr == nil {
+					if st.ClaudePID != 0 {
+						s.PID = st.ClaudePID
+					}
+					if st.URL != "" {
+						s.URL = st.URL
+					}
+					if st.Phase == ShimActive && s.Status == StatusStarting {
+						s.Status = StatusActive
+					}
+				}
+				go sm.watchSession(s, s.gen)
+				continue
+			}
 			s.Status = StatusDead
 			s.DiedAt = &now
-			sm.sessions[s.ID] = s
 			continue
 		}
 
-		s.Status = StatusActive
-		sm.sessions[s.ID] = s
-		go sm.pollProcess(s)
+		// Legacy session from before the shim existed: couchpilot held its PTY
+		// directly, so all we can do is poll the claude pid for liveness.
+		if s.PID > 0 && pidAlive(s.PID) && pidCommandContains(s.PID, "claude") {
+			s.Status = StatusActive
+			go sm.pollLegacy(s)
+		} else {
+			s.Status = StatusDead
+			s.DiedAt = &now
+		}
 	}
 
 	sm.persist()
 }
 
-func (sm *SessionManager) pollProcess(s *Session) {
+func (sm *SessionManager) pollLegacy(s *Session) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := syscall.Kill(s.PID, 0); err != nil {
+		if !pidAlive(s.PID) {
 			sm.markDead(s.ID)
 			return
 		}
@@ -356,13 +524,18 @@ func (sm *SessionManager) cleanupLoop() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
+		var removed []string
 		sm.mu.Lock()
 		for id, s := range sm.sessions {
-			if s.Status == StatusDead && s.DiedAt != nil && time.Since(*s.DiedAt) > 24*time.Hour {
+			if s.Status == StatusDead && s.DiedAt != nil && time.Since(*s.DiedAt) > deadRetention {
 				delete(sm.sessions, id)
+				removed = append(removed, id)
 			}
 		}
 		sm.mu.Unlock()
+		for _, id := range removed {
+			os.RemoveAll(sm.stateDir(id))
+		}
 		sm.persist()
 	}
 }
@@ -393,12 +566,91 @@ func (sm *SessionManager) loadFromDisk() ([]*Session, error) {
 	return sessions, json.Unmarshal(data, &sessions)
 }
 
+// pidAlive reports whether a process exists. Guard against pid<=0: kill(0)
+// and kill(-n) address process groups, not processes.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+// pidCommandContains sanity-checks that a recovered pid still belongs to the
+// process we think it does — after a reboot, pids get reshuffled and a stale
+// sessions.json could otherwise adopt some unrelated process.
+func pidCommandContains(pid int, substr string) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), substr)
+}
+
+// sessionFile locates claude's persisted conversation for this id, anywhere
+// under ~/.claude/projects — the uuid is globally unique, so no need to
+// reproduce claude's path-munging scheme.
+func sessionFile(uuid string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", uuid+".jsonl"))
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[0]
+}
+
+// sessionFileExists reports whether claude persisted a conversation for this
+// id. Sessions that never exchanged a message have nothing on disk and
+// `claude --resume` would hang on an interactive picker.
+func sessionFileExists(uuid string) bool {
+	return sessionFile(uuid) != ""
+}
+
+// bridgePattern extracts the Remote Control registration id that claude
+// records in its session file. The claude.ai app addresses RC sessions by
+// this id (cse_X maps to /code/session_X), not by the conversation uuid, so
+// a URL built from it is the canonical deep link.
+var bridgePattern = regexp.MustCompile(`"bridgeSessionId":"cse_([A-Za-z0-9_-]+)"`)
+
+// bridgeURL returns the canonical claude.ai URL for the session's current RC
+// registration, or "" if claude hasn't written one (yet). The last match wins:
+// every (re)launch registers a fresh bridge id.
+func bridgeURL(uuid string) string {
+	path := sessionFile(uuid)
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	ms := bridgePattern.FindAllSubmatch(data, -1)
+	if len(ms) == 0 {
+		return ""
+	}
+	return "https://claude.ai/code/session_" + string(ms[len(ms)-1][1])
+}
+
 func generateID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return strconv.FormatInt(time.Now().UnixNano(), 16)
 	}
 	return hex.EncodeToString(b)
+}
+
+// generateUUID returns a random v4 UUID, used as the claude --session-id so
+// couchpilot always knows the resume handle for every session it spawns.
+func generateUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("00000000-0000-4000-8000-%012x", time.Now().UnixNano()&0xffffffffffff)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // ansiPattern strips CSI sequences (including `?`-prefixed private modes like

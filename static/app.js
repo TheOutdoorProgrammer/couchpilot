@@ -208,6 +208,10 @@ async function dismissSession(id) {
   return api('/sessions/' + id + '/dismiss', { method: 'POST' });
 }
 
+async function resumeSession(id) {
+  return api('/sessions/' + id + '/resume', { method: 'POST' });
+}
+
 async function restartChannels() {
   return api('/channels/restart', { method: 'POST' });
 }
@@ -491,7 +495,11 @@ function renderSessions() {
         <button class="btn-kill" data-kill="${s.id}">Kill</button>
       </div>`;
     } else if (isExpanded && isDead) {
+      const resumeBtn = s.sessionUuid
+        ? `<button class="btn-resume" data-resume="${s.id}">Resume</button>`
+        : '';
       actions = `<div class="session-actions">
+        ${resumeBtn}
         <button class="btn-dismiss" data-dismiss-session="${s.id}">Dismiss</button>
       </div>`;
     }
@@ -837,6 +845,15 @@ function bindEvents() {
     if (dismissBtn) {
       e.stopPropagation();
       dismissSession(dismissBtn.dataset.dismissSession);
+      return;
+    }
+
+    const resumeBtn = e.target.closest('[data-resume]');
+    if (resumeBtn) {
+      e.stopPropagation();
+      resumeSession(resumeBtn.dataset.resume)
+        .then(() => toast('Resuming session...'))
+        .catch(err => toast(err.message, true));
       return;
     }
 

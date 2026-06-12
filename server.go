@@ -3,11 +3,13 @@ package main
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -113,6 +115,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleKillSession)
 	mux.HandleFunc("POST /api/sessions/{id}/dismiss", s.handleDismissSession)
+	mux.HandleFunc("POST /api/sessions/{id}/resume", s.handleResumeSession)
 	mux.HandleFunc("POST /api/channels/restart", s.handleRestartChannels)
 	mux.HandleFunc("GET /api/events", s.handleSSE)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
@@ -301,9 +304,32 @@ func (s *Server) ensureChannelsSession() {
 		return
 	}
 
+	// GetSessions is newest-first, so the first dead channels session we see
+	// is the most recent one.
+	var deadChannels *Session
 	for _, sess := range s.sm.GetSessions() {
-		if sess.IsChannels && sess.Status != StatusDead {
+		if !sess.IsChannels {
+			continue
+		}
+		if sess.Status != StatusDead {
 			return
+		}
+		if deadChannels == nil {
+			deadChannels = sess
+		}
+	}
+
+	// A channels session that died on its own (crash, reboot) resumes so the
+	// conversation context survives. Deliberate restarts set Discard and fall
+	// through to a fresh session. ResumeSession also refuses sessions with no
+	// saved conversation — fresh start covers those too.
+	if deadChannels != nil && !deadChannels.Discard && deadChannels.SessionUUID != "" {
+		if _, err := s.sm.ResumeSession(deadChannels.ID); err == nil {
+			log.Printf("channels session: resumed %s", deadChannels.ID)
+			s.dismissDeadChannelsSessions()
+			return
+		} else {
+			log.Printf("channels session: resume failed (%v); starting fresh", err)
 		}
 	}
 
@@ -341,6 +367,9 @@ func (s *Server) startChannelsSession() {
 func (s *Server) restartChannelsSession() {
 	for _, sess := range s.sm.GetSessions() {
 		if sess.IsChannels && sess.Status != StatusDead {
+			// Deliberate restart: flag it so ensureChannelsSession starts fresh
+			// instead of resuming the old conversation.
+			s.sm.SetDiscard(sess.ID)
 			s.sm.KillSession(sess.ID)
 		}
 	}
@@ -472,6 +501,20 @@ func (s *Server) handleDismissSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.sm.DismissSession(id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	session, err := s.sm.ResumeSession(id)
+	if err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, os.ErrNotExist) {
+			code = http.StatusNotFound
+		}
+		httpError(w, err.Error(), code)
+		return
+	}
+	writeJSON(w, session)
 }
 
 func (s *Server) handleRestartChannels(w http.ResponseWriter, r *http.Request) {

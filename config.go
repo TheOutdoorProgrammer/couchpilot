@@ -27,6 +27,11 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	home, _ := os.UserHomeDir()
 	configDir := filepath.Join(home, ".config", "couchpilot")
+	// Override for running isolated instances (tests, dev) without touching
+	// the real state.
+	if d := os.Getenv("COUCHPILOT_CONFIG_DIR"); d != "" {
+		configDir = d
+	}
 	configPath := filepath.Join(configDir, "config.json")
 
 	cfg := &Config{

@@ -31,8 +31,9 @@ The whole point: you're on the couch, you have an idea, you pull out your phone,
 
 - **🚀 One-tap session launch** — pick a project (with live git status), branch, model, effort level, and permission mode from a mobile-native bottom sheet. Create a new branch on the fly.
 - **📡 Live session dashboard** — every session with a real-time status dot (starting / active / dead), driven by Server-Sent Events. No refresh button.
-- **🔁 Auto-detection & recovery** — couchpilot notices when a session ends (killed from the app, the UI, or timed out) and updates instantly. Restart couchpilot and it re-adopts the sessions still running.
-- **💬 iMessage channels** — keep a dedicated session alive that bridges iMessage to Claude Code, auto-restarting if it dies. Text your agents.
+- **🔁 Restart-proof sessions** — each session runs under a tiny detached shim process that owns its PTY, so restarting (or upgrading) couchpilot never touches a running session. On startup couchpilot re-adopts every session whose shim is still alive.
+- **⏪ Resumable sessions** — dead sessions keep their conversation id and get a **Resume** button: the conversation picks up exactly where it left off, re-registered with Remote Control under the same name.
+- **💬 iMessage channels** — keep a dedicated session alive that bridges iMessage to Claude Code. If it crashes, it auto-resumes with its conversation context intact; the Restart button starts it fresh. Text your agents.
 - **🔐 Password authentication** — on by default, with a one-tap setup. Disable it for a trusted private network if you prefer.
 - **📁 Project roots & favorites** — point couchpilot at the folders where your projects live; they show up in the picker with branch, ahead/behind, and dirty-file counts.
 - **🧠 Live model catalog** — the model picker is populated from the latest Claude models, with aliases and a custom-ID escape hatch.
@@ -199,7 +200,7 @@ Tap **+ New Session** and fill in the sheet:
 - **Branch** — check out an existing branch, or create a new one from a base branch, before the session starts.
 - **Permission Mode**, **Model**, **Effort** — default to your configured values; override per session.
 
-Tap **Launch**. couchpilot spawns the `claude` process, scrapes the claude.ai remote-control URL from its output, and the session appears with a live status dot.
+Tap **Launch**. couchpilot picks a conversation id for the session, spawns the `claude` process under its shim, and the card appears with a live status dot — green once the TUI reports **Remote Control active**.
 
 ### Drive a session
 
@@ -207,6 +208,7 @@ Tap a session card to expand it:
 
 - **Open in Claude** — jumps to the session in the Claude app / claude.ai.
 - **Kill** — terminates the session (and its child processes).
+- **Resume** — on a dead session: relaunches `claude --resume` with the same conversation, name, and settings. Sessions that never exchanged a message have nothing on disk to resume and report an error instead; sessions created before resume support don't show the button.
 - **Dismiss** — clears a dead session from the list.
 
 ### Settings
@@ -276,16 +278,20 @@ Register it in `~/.claude/plugins/known_marketplaces.json`.
 
 ## How it works
 
-Each session spawns a `claude --remote-control <name>` process under a pseudo-terminal, with the flags for your chosen model, effort, permission mode, and channels. couchpilot:
+couchpilot never holds a session's PTY itself. Each session is spawned through a tiny detached **shim** (`couchpilot _shim`, the same binary) that is setsid'd into its own process session, so the session's lifetime is decoupled from couchpilot's — restart or upgrade couchpilot and nothing happens to your sessions.
 
-1. starts the process and scrapes the `claude.ai` remote-control URL from its output,
-2. tracks liveness — via the PTY while it owns the process, and via signal-0 polling for sessions re-adopted after a restart,
-3. broadcasts state changes to every connected browser over **Server-Sent Events**, so the dashboard is always live,
-4. persists session metadata to `~/.config/couchpilot/sessions.json` and re-adopts still-running processes on startup.
+For every session, couchpilot picks a conversation UUID and launches `claude --remote-control <name> --session-id <uuid>` (plus your model/effort/permission/channels flags) under the shim. The shim:
 
-Sessions are started in their own session/process group, so terminating one cleanly signals the whole group — Claude's child processes (node, MCP servers, hooks) get reaped instead of orphaned.
+1. owns the PTY master, drains the TUI's output, and auto-accepts the bypass-permissions dialog when that mode is on,
+2. watches the ANSI-stripped output for the **Remote Control active** status line (recent Claude Code versions no longer print a session URL; older ones that do get it scraped, legacy-style),
+3. maintains `state.json` (phase, claude pid, exit code) atomically and keeps the last 64 KB of output in `tail.log` for debugging,
+4. forwards SIGTERM to claude's process group — so killing a session reaps its whole child tree (node, MCP servers, hooks) — and exits when claude exits.
 
-Set `COUCHPILOT_DEBUG=1` in the environment to log raw session PTY output for troubleshooting. It's off by default — the Claude TUI redraws constantly and would otherwise flood the logs.
+couchpilot watches each shim's state file and pid, broadcasts changes to every browser over **Server-Sent Events**, and persists metadata to `~/.config/couchpilot/sessions.json`. On startup it re-adopts sessions whose shims are still running and marks the rest dead.
+
+**Open in Claude** links start as `https://claude.ai/code/<conversation-uuid>` and are upgraded to the canonical deep link as soon as claude records its Remote Control registration (`bridgeSessionId`) in the session file — the app addresses RC sessions by that id, not the conversation uuid.
+
+Because couchpilot always knows each session's conversation id, a dead session can be **resumed**: `claude --remote-control <name> --resume <uuid>` restores the full conversation and re-registers with Remote Control. Dead sessions stay listed (and resumable) for 24 hours.
 
 ### State & files
 
@@ -294,6 +300,7 @@ Set `COUCHPILOT_DEBUG=1` in the environment to log raw session PTY output for tr
 | `~/.config/couchpilot/config.json` | Configuration. |
 | `~/.config/couchpilot/auth.json` | Password hash + signing secret (`0600`). |
 | `~/.config/couchpilot/sessions.json` | Persisted session metadata. |
+| `~/.config/couchpilot/sessions/<id>/` | Per-session shim state: `state.json`, `tail.log` (last 64 KB of output), `shim.log`. Removed when the session is dismissed or ages out. |
 | `~/.config/couchpilot/stdout.log`, `stderr.log` | LaunchAgent logs. |
 | `~/Library/LaunchAgents/com.couchpilot.server.plist` | macOS service definition. |
 
@@ -313,7 +320,7 @@ For access from anywhere — or to avoid exposing it on a shared LAN — put you
 | --- | --- |
 | **"account not found" / sessions won't start** | Make sure `claude` is on the `PATH` the service sees, and that you've run `claude login`. From the LaunchAgent, `PATH` is `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`. |
 | **Locked out of the UI** | Delete `~/.config/couchpilot/auth.json` and restart — back to first-run setup. |
-| **Session stuck on "Waiting for URL…"** | The process didn't print a claude.ai URL yet. Check `stderr.log`, or run with `COUCHPILOT_DEBUG=1` to see raw output. |
+| **Session stuck on yellow/starting** | The shim never saw "Remote Control active" in the TUI output. Check `~/.config/couchpilot/sessions/<id>/tail.log` for what the session is actually showing (login prompt, error, changed status text). |
 | **Channels session keeps dying** | Verify the forked-plugin setup above; check `stderr.log` for the spawn error. |
 | **Can't reach it from your phone** | Confirm the machine's firewall allows the port and you're on the same network (or tailnet). |
 
@@ -323,9 +330,11 @@ For access from anywhere — or to avoid exposing it on a shared LAN — put you
 
 ```bash
 go build -o couchpilot . && ./couchpilot            # build & run
-COUCHPILOT_DEBUG=1 ./couchpilot                      # verbose session logging
+COUCHPILOT_CONFIG_DIR=/tmp/cp-dev ./couchpilot -port 7099  # isolated dev instance
 go vet ./... && gofmt -l .                           # lint
 ```
+
+Per-session output lives in `~/.config/couchpilot/sessions/<id>/tail.log` (rolling, bounded), which replaces the old `COUCHPILOT_DEBUG` firehose.
 
 The web UI lives in `static/` and is embedded into the binary at build time, so a plain `go build` produces a self-contained executable — no asset bundling step.
 
@@ -335,7 +344,8 @@ The web UI lives in `static/` and is embedded into the binary at build time, so 
 | --- | --- |
 | `main.go` | CLI entry point, LaunchAgent install/uninstall, version. |
 | `server.go` | HTTP server, routes, SSE hub, auth middleware, config API. |
-| `session.go` | Session lifecycle — spawn, PTY scan, liveness, persistence. |
+| `session.go` | Session lifecycle — shim spawn, state watching, resume, persistence. |
+| `shim.go` | Detached per-session PTY owner — output scanning, state file, signal forwarding. |
 | `auth.go` | Password hashing, signed cookie tokens, auth storage. |
 | `config.go` | Config load/save. |
 | `login.go` | Interactive `claude login` over a PTY. |
