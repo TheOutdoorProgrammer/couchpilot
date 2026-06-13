@@ -26,6 +26,10 @@ type modelCache struct {
 
 var models = &modelCache{ttl: 24 * time.Hour}
 
+// modelsCatalogURL is the upstream model metadata source. Kept as a var so
+// tests can point the parser at a local server.
+var modelsCatalogURL = "https://models.dev/catalog.json"
+
 type catalogEntry struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -57,7 +61,7 @@ func (mc *modelCache) Get() []ModelInfo {
 
 func fetchAnthropicModels() []ModelInfo {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://models.dev/catalog.json")
+	resp, err := client.Get(modelsCatalogURL)
 	if err != nil {
 		log.Printf("models: fetch failed: %v", err)
 		return nil

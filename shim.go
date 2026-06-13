@@ -42,11 +42,11 @@ type ShimState struct {
 }
 
 const (
-	shimStateFile  = "state.json"
-	shimTailFile   = "tail.log"
-	shimLogFile    = "shim.log"
+	shimStateFile   = "state.json"
+	shimTailFile    = "tail.log"
+	shimLogFile     = "shim.log"
 	shimInputSocket = "input.sock"
-	shimTailMax    = 64 * 1024
+	shimTailMax     = 64 * 1024
 )
 
 // activeMarker matches the Remote Control status line in the TUI footer.

@@ -9,7 +9,12 @@ permissions:
   contents: write
 
 jobs:
+  # Gate: a tagged release won't build unless the full test suite passes.
+  test:
+    uses: ./.github/workflows/test.yml
+
   goreleaser:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
