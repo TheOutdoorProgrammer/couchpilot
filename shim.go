@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -40,10 +42,11 @@ type ShimState struct {
 }
 
 const (
-	shimStateFile = "state.json"
-	shimTailFile  = "tail.log"
-	shimLogFile   = "shim.log"
-	shimTailMax   = 64 * 1024
+	shimStateFile  = "state.json"
+	shimTailFile   = "tail.log"
+	shimLogFile    = "shim.log"
+	shimInputSocket = "input.sock"
+	shimTailMax    = 64 * 1024
 )
 
 // activeMarker matches the Remote Control status line in the TUI footer.
@@ -129,6 +132,7 @@ func cmdShim() {
 	}
 
 	go w.tailFlusher()
+	go serveInputSocket(ptmx, *stateDir)
 
 	// Drain the PTY until EOF — even after going active — or claude blocks on
 	// a full buffer. Raw reads, not bufio: TUI redraws have no newlines.
@@ -222,4 +226,31 @@ func (w *shimWriter) flushTail() {
 	w.tailDirty = false
 	w.mu.Unlock()
 	os.WriteFile(filepath.Join(w.stateDir, shimTailFile), data, 0644)
+}
+
+// serveInputSocket accepts connections on a Unix socket in the state directory
+// and forwards any data received to the PTY master. This lets couchpilot send
+// input (like /model commands) to the session without holding the PTY itself.
+func serveInputSocket(ptmx *os.File, stateDir string) {
+	sockPath := filepath.Join(stateDir, shimInputSocket)
+	os.Remove(sockPath)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Printf("shim: input socket: %v", err)
+		return
+	}
+	defer ln.Close()
+	defer os.Remove(sockPath)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer conn.Close()
+			io.Copy(ptmx, conn)
+		}()
+	}
 }

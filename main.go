@@ -34,6 +34,9 @@ func main() {
 		case "_shim":
 			cmdShim()
 			return
+		case "_hook":
+			cmdHook()
+			return
 		case "install":
 			cmdInstall()
 			return
@@ -58,13 +61,25 @@ func main() {
 	}
 
 	hub := NewSSEHub()
+	rm, err := NewReviewManager(cfg.DataDir(), hub)
+	if err != nil {
+		log.Fatalf("reviews: %v", err)
+	}
 	sm := NewSessionManager(cfg.DataDir(), hub)
+	sm.SetHookEnv(cfg.Port, rm.HookToken())
+	rm.reviewOn = sm.ReviewModeOn
+	sm.onSessionDied = rm.CancelForSession
+	sm.onSessionDismissed = rm.DropSession
 	lm := NewLoginManager(hub)
 	am, err := NewAuthManager(cfg.DataDir())
 	if err != nil {
 		log.Fatalf("auth: %v", err)
 	}
-	srv := NewServer(cfg, sm, lm, hub, am)
+	pm, err := NewPushManager(cfg.DataDir())
+	if err != nil {
+		log.Fatalf("push: %v", err)
+	}
+	srv := NewServer(cfg, sm, lm, hub, am, rm, pm)
 
 	log.Printf("couchpilot listening on http://localhost:%d", cfg.Port)
 	if err := srv.Start(); err != nil {

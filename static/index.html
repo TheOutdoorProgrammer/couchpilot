@@ -7,7 +7,10 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#0d1117">
   <title>couchpilot</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/static/icons/icon-180.png">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/vendor/hljs-dracula.css">
 </head>
 <body>
   <div id="auth-gate" class="auth-gate" hidden>
@@ -37,6 +40,12 @@
 
   <header>
     <h1>couchpilot</h1>
+    <button id="review-bell" class="icon-btn review-bell" aria-label="Pending reviews" hidden>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/><path d="m9 14 2 2 4-4"/>
+      </svg>
+      <span class="review-bell-count" id="review-bell-count">0</span>
+    </button>
     <button id="settings-btn" class="icon-btn" aria-label="Settings">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -123,6 +132,16 @@
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
+        </div>
+        <div class="field">
+          <label class="toggle-field">
+            <span>Full code review</span>
+            <span class="toggle">
+              <input type="checkbox" id="session-review">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+          <p class="subtle" style="margin-top:6px;">Every file change waits in a review screen for your approval before it's written. Toggleable later from the session card.</p>
         </div>
         <div class="form-actions">
           <button type="button" class="btn btn-ghost" data-dismiss="new-modal">Cancel</button>
@@ -225,6 +244,18 @@
               </div>
             </div>
           </div>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="section-title">Notifications</h3>
+          <label class="toggle-field">
+            <span>Push notifications on this device</span>
+            <span class="toggle">
+              <input type="checkbox" id="push-enabled">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+          <p class="subtle" id="push-hint" style="margin-top:8px;">Get notified when a code review is waiting. Changes apply immediately — not on Save.</p>
         </section>
 
         <section class="settings-section">
@@ -335,6 +366,47 @@
     </div>
   </div>
 
+  <div id="review-screen" class="review-screen" hidden>
+    <div class="review-head">
+      <button id="review-back" class="icon-btn" aria-label="Back">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+      <div class="review-title">
+        <div class="review-file" id="review-file"></div>
+        <div class="review-sub" id="review-sub"></div>
+      </div>
+      <button id="review-wrap" class="icon-btn" aria-label="Toggle word wrap" aria-pressed="true" title="Word wrap">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M3 12h13a3 3 0 1 1 0 6h-4"/><path d="m14 16-2 2 2 2"/><path d="M3 18h6"/></svg>
+      </button>
+      <div class="review-nav" id="review-nav" hidden>
+        <button id="review-prev" class="icon-btn" aria-label="Previous review">‹</button>
+        <span id="review-pos"></span>
+        <button id="review-next" class="icon-btn" aria-label="Next review">›</button>
+      </div>
+    </div>
+    <div class="review-body" id="review-body"></div>
+    <div class="review-foot" id="review-foot">
+      <button id="review-global-btn" class="btn btn-ghost" title="Add overall comment">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span id="review-comment-count" class="comment-count" hidden>0</span>
+      </button>
+      <button id="review-deny" class="btn btn-danger">Deny</button>
+      <button id="review-approve" class="btn btn-primary">Approve</button>
+    </div>
+    <div class="review-decided-bar" id="review-decided-bar" hidden></div>
+
+    <div id="composer-overlay" class="composer-overlay" hidden></div>
+    <div id="composer" class="composer" hidden>
+      <div class="composer-target" id="composer-target"></div>
+      <textarea id="composer-text" placeholder="Leave a comment…" rows="3" autocapitalize="sentences"></textarea>
+      <div class="composer-actions">
+        <button id="composer-cancel" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="composer-save" class="btn btn-primary" type="button">Comment</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/highlight.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

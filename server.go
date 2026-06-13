@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +13,28 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	webpush "github.com/SherClockHolmes/webpush-go"
 )
+
+// assetVersion is a short hash of app.js+style.css content, computed at
+// startup and injected into HTML asset URLs as ?v=HASH to bust iOS caches.
+var assetVersion string
+
+func init() {
+	h := sha256.New()
+	for _, f := range []string{"static/app.js", "static/style.css"} {
+		if data, err := staticFS.ReadFile(f); err == nil {
+			h.Write(data)
+		}
+	}
+	assetVersion = hex.EncodeToString(h.Sum(nil))[:8]
+	log.Printf("asset version: %s", assetVersion)
+}
 
 //go:embed static
 var staticFS embed.FS
@@ -64,10 +85,12 @@ type Server struct {
 	lm    *LoginManager
 	hub   *SSEHub
 	am    *AuthManager
+	rm    *ReviewManager
+	pm    *PushManager
 }
 
-func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub, am *AuthManager) *Server {
-	srv := &Server{cfg: cfg, sm: sm, lm: lm, hub: hub, am: am}
+func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub, am *AuthManager, rm *ReviewManager, pm *PushManager) *Server {
+	srv := &Server{cfg: cfg, sm: sm, lm: lm, hub: hub, am: am, rm: rm, pm: pm}
 
 	sm.onChannelsDied = func() {
 		srv.ensureChannelsSession()
@@ -106,10 +129,36 @@ func (s *Server) Start() error {
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		data, _ := staticFS.ReadFile("static/index.html")
+		data = bytes.ReplaceAll(data, []byte(`/static/app.js"`), []byte(`/static/app.js?v=`+assetVersion+`"`))
+		data = bytes.ReplaceAll(data, []byte(`/static/style.css"`), []byte(`/static/style.css?v=`+assetVersion+`"`))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Write(data)
 	})
-	mux.Handle("GET /static/", http.StripPrefix("/static/", fileServer))
+	// Embedded files carry no modtime, so without explicit headers browsers
+	// cache them heuristically — iOS home-screen web apps in particular hold
+	// stale copies across deploys. no-cache forces revalidation (a refetch
+	// here, since there are no validators), so installed PWAs pick up new
+	// assets on next launch.
+	staticHandler := http.StripPrefix("/static/", fileServer)
+	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		staticHandler.ServeHTTP(w, r)
+	})
+
+	// The service worker must be served from the root so its scope covers the
+	// whole app; the manifest rides along for the same clean-URL reason.
+	mux.HandleFunc("GET /sw.js", func(w http.ResponseWriter, r *http.Request) {
+		data, _ := staticFS.ReadFile("static/sw.js")
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write(data)
+	})
+	mux.HandleFunc("GET /manifest.json", func(w http.ResponseWriter, r *http.Request) {
+		data, _ := staticFS.ReadFile("static/manifest.json")
+		w.Header().Set("Content-Type", "application/manifest+json")
+		w.Write(data)
+	})
 
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
@@ -128,6 +177,24 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/login", s.handleLoginStart)
 	mux.HandleFunc("POST /api/login/input", s.handleLoginInput)
 	mux.HandleFunc("DELETE /api/login", s.handleLoginStop)
+
+	mux.HandleFunc("GET /api/reviews", s.handleListReviews)
+	mux.HandleFunc("GET /api/reviews/{id}", s.handleGetReview)
+	mux.HandleFunc("POST /api/reviews/{id}/comments", s.handleAddReviewComment)
+	mux.HandleFunc("DELETE /api/reviews/{id}/comments/{cid}", s.handleDeleteReviewComment)
+	mux.HandleFunc("POST /api/reviews/{id}/decision", s.handleReviewDecision)
+	mux.HandleFunc("PUT /api/sessions/{id}/model", s.handleChangeModel)
+	mux.HandleFunc("POST /api/sessions/{id}/review-mode", s.handleSetReviewMode)
+
+	// Hook endpoints: called by `couchpilot _hook` processes over loopback.
+	// They authenticate with the hook token instead of the session cookie.
+	mux.HandleFunc("POST /api/hook/review", s.handleHookReview)
+	mux.HandleFunc("GET /api/hook/review/{id}/wait", s.handleHookWait)
+	mux.HandleFunc("POST /api/hook/posttool", s.handleHookPost)
+
+	mux.HandleFunc("GET /api/push/key", s.handlePushKey)
+	mux.HandleFunc("POST /api/push/subscribe", s.handlePushSubscribe)
+	mux.HandleFunc("POST /api/push/unsubscribe", s.handlePushUnsubscribe)
 
 	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
@@ -162,6 +229,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 func authRequired(path string) bool {
 	if !strings.HasPrefix(path, "/api/") {
 		return false // static assets must load so the login page can render
+	}
+	if strings.HasPrefix(path, "/api/hook/") {
+		return false // hook processes have no cookie; they present the hook token
 	}
 	switch path {
 	case "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/version":
@@ -386,6 +456,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		PermissionMode string `json:"permissionMode"`
 		Model          string `json:"model"`
 		Effort         string `json:"effort"`
+		ReviewMode     bool   `json:"reviewMode"`
 		Branch         string `json:"branch"`
 		CreateBranch   bool   `json:"createBranch"`
 		BranchFrom     string `json:"branchFrom"`
@@ -423,6 +494,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		PermMode:     permMode,
 		Model:        model,
 		Effort:       effort,
+		ReviewMode:   req.ReviewMode,
 		Branch:       req.Branch,
 		CreateBranch: req.CreateBranch,
 		BranchFrom:   req.BranchFrom,
@@ -665,6 +737,237 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, versionInfo())
+}
+
+// --- code review ---
+
+func (s *Server) handleListReviews(w http.ResponseWriter, r *http.Request) {
+	views := s.rm.List(r.URL.Query().Get("session"), r.URL.Query().Get("status") == "pending")
+	if views == nil {
+		views = []*reviewView{}
+	}
+	writeJSON(w, views)
+}
+
+func (s *Server) handleGetReview(w http.ResponseWriter, r *http.Request) {
+	v := s.rm.Get(r.PathValue("id"), true)
+	if v == nil {
+		httpError(w, "review not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, v)
+}
+
+func (s *Server) handleAddReviewComment(w http.ResponseWriter, r *http.Request) {
+	var c ReviewComment
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	added, err := s.rm.AddComment(r.PathValue("id"), c)
+	if err != nil {
+		httpError(w, err.Error(), reviewErrCode(err))
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, added)
+}
+
+func (s *Server) handleDeleteReviewComment(w http.ResponseWriter, r *http.Request) {
+	if err := s.rm.DeleteComment(r.PathValue("id"), r.PathValue("cid")); err != nil {
+		httpError(w, err.Error(), reviewErrCode(err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleReviewDecision(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	review, err := s.rm.Decide(r.PathValue("id"), req.Action)
+	if err != nil {
+		httpError(w, err.Error(), reviewErrCode(err))
+		return
+	}
+	writeJSON(w, s.rm.Get(review.ID, false))
+}
+
+func (s *Server) handleChangeModel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Model == "" {
+		httpError(w, "model is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.sm.ChangeModel(r.PathValue("id"), req.Model); err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			code = http.StatusNotFound
+		}
+		httpError(w, err.Error(), code)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleSetReviewMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := s.sm.SetReviewMode(r.PathValue("id"), req.Enabled); err != nil {
+		httpError(w, "session not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func reviewErrCode(err error) int {
+	if errors.Is(err, os.ErrNotExist) {
+		return http.StatusNotFound
+	}
+	return http.StatusConflict
+}
+
+// --- hook endpoints (loopback callers authenticated by the hook token) ---
+
+func (s *Server) hookAuthed(r *http.Request) bool {
+	return s.rm.CheckToken(r.Header.Get("X-Couchpilot-Hook"))
+}
+
+func (s *Server) handleHookReview(w http.ResponseWriter, r *http.Request) {
+	if !s.hookAuthed(r) {
+		httpError(w, "bad hook token", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		SessionID string          `json:"sessionId"`
+		Event     json.RawMessage `json:"event"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	var ev hookEvent
+	if err := json.Unmarshal(req.Event, &ev); err != nil {
+		httpError(w, "invalid hook event", http.StatusBadRequest)
+		return
+	}
+	review, err := s.rm.Submit(req.SessionID, ev)
+	if err != nil {
+		// A malformed proposal must not brick the session's writes; the gate
+		// only applies to changes it can actually render for review.
+		log.Printf("review: submit failed for %s (%s): %v", req.SessionID, ev.ToolName, err)
+		writeJSON(w, map[string]string{"action": "allow"})
+		return
+	}
+	if review == nil {
+		writeJSON(w, map[string]string{"action": "allow"})
+		return
+	}
+	s.notifyReview(review)
+	writeJSON(w, map[string]string{"action": "review", "reviewId": review.ID})
+}
+
+func (s *Server) handleHookWait(w http.ResponseWriter, r *http.Request) {
+	if !s.hookAuthed(r) {
+		httpError(w, "bad hook token", http.StatusUnauthorized)
+		return
+	}
+	status, reason, ok := s.rm.Wait(r.PathValue("id"), 50*time.Second)
+	if !ok {
+		writeJSON(w, map[string]string{"status": "gone"})
+		return
+	}
+	writeJSON(w, map[string]string{"status": string(status), "reason": reason})
+}
+
+// notifyReview pushes a notification for a freshly created review. Tapping it
+// deep-links into the review screen.
+func (s *Server) notifyReview(r *Review) {
+	name := r.SessionID
+	s.sm.mu.RLock()
+	if sess, ok := s.sm.sessions[r.SessionID]; ok {
+		name = sess.Name
+	}
+	s.sm.mu.RUnlock()
+
+	verb := "write"
+	switch r.ToolName {
+	case "Edit", "MultiEdit":
+		verb = "edit"
+	case "NotebookEdit":
+		verb = "edit notebook"
+	}
+	s.pm.Send(pushPayload{
+		Title: "Code review: " + filepath.Base(r.FilePath),
+		Body:  fmt.Sprintf("%s wants to %s %s", name, verb, r.FilePath),
+		URL:   "/?review=" + r.ID,
+		Tag:   "review-" + r.ID,
+	})
+}
+
+// --- web push ---
+
+func (s *Server) handlePushKey(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{"key": s.pm.PublicKey()})
+}
+
+func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
+	var sub webpush.Subscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil || sub.Endpoint == "" {
+		httpError(w, "invalid subscription", http.StatusBadRequest)
+		return
+	}
+	if err := s.pm.Subscribe(sub); err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := s.pm.Unsubscribe(req.Endpoint); err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleHookPost(w http.ResponseWriter, r *http.Request) {
+	if !s.hookAuthed(r) {
+		httpError(w, "bad hook token", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		SessionID string `json:"sessionId"`
+		ToolUseID string `json:"toolUseId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"context": s.rm.TakePostContext(req.SessionID, req.ToolUseID)})
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {

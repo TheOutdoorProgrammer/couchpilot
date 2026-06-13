@@ -9,6 +9,9 @@ let authStatus = {};
 let appStarted = false;
 let settingsDraft = {};
 let appVersion = '';
+let reviews = [];        // review metadata, newest first (no hunks)
+let activeReview = null; // full review (with hunks) shown in the review screen
+let composerCtx = null;  // line target for the open comment composer; null = global
 
 document.addEventListener('DOMContentLoaded', init);
 
@@ -33,8 +36,18 @@ async function startApp() {
   appStarted = true;
   await fetchConfig();
   await fetchModels();
+  await fetchReviewsList();
   connectSSE();
   bindEvents();
+  bindReviewEvents();
+  initPush();
+
+  // Deep link from a push notification: /?review=<id>
+  const wanted = new URLSearchParams(location.search).get('review');
+  if (wanted) {
+    history.replaceState(null, '', '/');
+    openReviewScreen(wanted);
+  }
 }
 
 // --- API ---
@@ -216,6 +229,17 @@ async function restartChannels() {
   return api('/channels/restart', { method: 'POST' });
 }
 
+async function changeSessionModel(id, modelId) {
+  return api('/sessions/' + id + '/model', { method: 'PUT', body: JSON.stringify({ model: modelId }) });
+}
+
+function modelDisplayName(modelId) {
+  if (!modelId) return 'default';
+  const entry = getModelEntries().find(m => m.id === modelId);
+  if (entry) return entry.family === 'aliases' ? entry.name : entry.name.replace('Claude ', '');
+  return modelId;
+}
+
 async function fetchModels() {
   try {
     cachedModels = await api('/models') || [];
@@ -226,6 +250,7 @@ async function fetchModels() {
 }
 
 let activeModelPickerTarget = null;
+let pendingModelSessionId = null;
 
 function getModelEntries() {
   const aliases = [
@@ -259,8 +284,10 @@ function renderModelPicker(query) {
   }
 
   const parts = [];
-  const emptyLabel = activeModelPickerTarget === 'session-model' ? 'Default' : 'None';
-  parts.push(`<button type="button" class="picker-item" data-model-id=""><div class="picker-item-main"><span class="picker-item-name">${emptyLabel}</span></div></button>`);
+  if (!pendingModelSessionId) {
+    const emptyLabel = activeModelPickerTarget === 'session-model' ? 'Default' : 'None';
+    parts.push(`<button type="button" class="picker-item" data-model-id=""><div class="picker-item-main"><span class="picker-item-name">${emptyLabel}</span></div></button>`);
+  }
 
   for (const fam of ordered) {
     const label = fam === 'aliases' ? 'Aliases' : fam.replace('claude-', '').replace(/^./, c => c.toUpperCase());
@@ -292,7 +319,8 @@ function openModelPicker(target) {
   renderModelPicker('');
   openModal('model-picker-modal');
 
-  const currentId = document.getElementById(target + '-hidden').value;
+  const hiddenEl = document.getElementById(target + '-hidden');
+  const currentId = hiddenEl ? hiddenEl.value : '';
   if (currentId && currentId !== '__custom__') {
     requestAnimationFrame(() => {
       const el = document.querySelector(`#model-picker-list .picker-item[data-model-id="${CSS.escape(currentId)}"]`);
@@ -304,6 +332,7 @@ function openModelPicker(target) {
 function closeModelPicker() {
   closeModal('model-picker-modal');
   activeModelPickerTarget = null;
+  pendingModelSessionId = null;
 }
 
 function selectModel(target, modelId) {
@@ -393,6 +422,10 @@ function connectSSE() {
   eventSource.addEventListener('init', (e) => {
     sessions = JSON.parse(e.data);
     render();
+    // init fires on every (re)connect. Reviews created while this client was
+    // disconnected (phone locked, PWA suspended) aren't replayed by SSE, so
+    // refetch them or they stay invisible until a full page reload.
+    fetchReviewsList().then(render);
   });
 
   eventSource.addEventListener('session_created', (e) => {
@@ -424,6 +457,27 @@ function connectSSE() {
     render();
   });
 
+  eventSource.addEventListener('review_created', (e) => {
+    const v = JSON.parse(e.data);
+    upsertReview(v);
+    const sess = sessions.find(s => s.id === v.sessionId);
+    toast(`Review requested: ${baseName(v.filePath)}${sess ? ' · ' + sess.name : ''}`);
+    render();
+    syncReviewScreen(v);
+  });
+
+  eventSource.addEventListener('review_updated', (e) => {
+    upsertReview(JSON.parse(e.data));
+    render();
+  });
+
+  eventSource.addEventListener('review_decided', (e) => {
+    const v = JSON.parse(e.data);
+    upsertReview(v);
+    render();
+    syncReviewScreen(v);
+  });
+
   eventSource.addEventListener('login_started', (e) => {
     const state = JSON.parse(e.data);
     setLoginState(state, { replace: true });
@@ -453,6 +507,7 @@ function connectSSE() {
 
 function render() {
   renderSessions();
+  renderReviewBell();
 }
 
 function renderSessions() {
@@ -477,6 +532,14 @@ function renderSessions() {
       ? 'Ended ' + timeAgo(s.diedAt)
       : timeAgo(s.createdAt);
 
+    const pendingCount = reviews.filter(r => r.sessionId === s.id && r.status === 'pending').length;
+    const reviewBadge = pendingCount > 0
+      ? `<button class="review-badge" data-open-reviews="${s.id}" aria-label="Pending reviews">${pendingCount}</button>`
+      : '';
+    const reviewChip = s.reviewMode ? '<span class="review-mode-chip" title="Code review on">review</span>' : '';
+    const reviewToggleBtn = isDead ? '' :
+      `<button class="btn-review-toggle ${s.reviewMode ? 'on' : ''}" data-review-toggle="${s.id}">Review: ${s.reviewMode ? 'On' : 'Off'}</button>`;
+
     let actions = '';
     if (isExpanded && s.isChannels) {
       const openLink = s.url
@@ -484,6 +547,7 @@ function renderSessions() {
         : `<span class="btn-open" style="opacity:0.4;pointer-events:none">${isDead ? 'Restarting...' : 'Waiting for URL...'}</span>`;
       actions = `<div class="session-actions">
         ${openLink}
+        ${reviewToggleBtn}
         <button class="btn-restart" data-restart-channels>Restart</button>
       </div>`;
     } else if (isExpanded && !isDead) {
@@ -492,6 +556,7 @@ function renderSessions() {
         : `<span class="btn-open" style="opacity:0.4;pointer-events:none">Waiting for URL...</span>`;
       actions = `<div class="session-actions">
         ${openLink}
+        ${reviewToggleBtn}
         <button class="btn-kill" data-kill="${s.id}">Kill</button>
       </div>`;
     } else if (isExpanded && isDead) {
@@ -504,16 +569,26 @@ function renderSessions() {
       </div>`;
     }
 
+    const modelRow = isExpanded && !isDead
+      ? `<div class="session-model-row">
+          <span class="model-label">Model</span>
+          <button class="btn-model-change" data-change-model="${s.id}">${esc(modelDisplayName(s.model))}</button>
+        </div>`
+      : '';
+
     return `<div class="session-card ${isDead ? 'dead-card' : ''} ${isExpanded ? 'expanded' : ''}" data-id="${s.id}">
       <div class="session-header">
         <span class="status-dot ${statusClass}"></span>
         <span class="session-name">${esc(name)}</span>
+        ${reviewChip}
+        ${reviewBadge}
       </div>
       <div class="session-meta">
         <span>${esc(dir)}</span>
         <span class="sep">&middot;</span>
         <span>${time}</span>
       </div>
+      ${modelRow}
       ${actions}
     </div>`;
   }).join('');
@@ -751,6 +826,7 @@ function openSettings() {
   document.getElementById('channels-config').style.display = config.channelsEnabled ? '' : 'none';
   document.getElementById('default-channels').value = config.defaultChannels || '';
   renderSecurity();
+  renderPushState();
   renderVersionLabels();
   openModal('settings-modal');
 }
@@ -774,6 +850,23 @@ function bindEvents() {
   document.getElementById('settings-btn').addEventListener('click', openSettings);
 
   document.getElementById('default-perm-mode').addEventListener('change', updatePermWarn);
+
+  document.getElementById('push-enabled').addEventListener('change', async (e) => {
+    const wantOn = e.target.checked;
+    try {
+      if (wantOn) {
+        await enablePush();
+        toast('Push notifications on');
+      } else {
+        await disablePush();
+        toast('Push notifications off');
+      }
+    } catch (err) {
+      e.target.checked = !wantOn;
+      toast(err.message, true);
+    }
+    renderPushState();
+  });
 
   document.getElementById('auth-enabled').addEventListener('change', async (e) => {
     const wantOn = e.target.checked;
@@ -820,6 +913,33 @@ function bindEvents() {
   });
 
   document.getElementById('sessions').addEventListener('click', (e) => {
+    const modelBtn = e.target.closest('[data-change-model]');
+    if (modelBtn) {
+      e.stopPropagation();
+      pendingModelSessionId = modelBtn.dataset.changeModel;
+      openModelPicker('live-model');
+      return;
+    }
+
+    const reviewToggle = e.target.closest('[data-review-toggle]');
+    if (reviewToggle) {
+      e.stopPropagation();
+      const id = reviewToggle.dataset.reviewToggle;
+      const sess = sessions.find(s => s.id === id);
+      const next = !(sess && sess.reviewMode);
+      api('/sessions/' + id + '/review-mode', { method: 'POST', body: JSON.stringify({ enabled: next }) })
+        .then(() => toast(next ? 'Code review on — file changes now wait for you' : 'Code review off'))
+        .catch(err => toast(err.message, true));
+      return;
+    }
+
+    const openReviews = e.target.closest('[data-open-reviews]');
+    if (openReviews) {
+      e.stopPropagation();
+      openNextPendingReview(openReviews.dataset.openReviews);
+      return;
+    }
+
     const killBtn = e.target.closest('[data-kill]');
     if (killBtn) {
       e.stopPropagation();
@@ -896,6 +1016,7 @@ function bindEvents() {
         permissionMode: form.permissionMode.value,
         model: getModelValue('session-model'),
         effort: form.effort.value,
+        reviewMode: document.getElementById('session-review').checked,
         branch,
         createBranch,
         branchFrom,
@@ -1052,8 +1173,21 @@ function bindEvents() {
   document.getElementById('model-picker-list').addEventListener('click', (e) => {
     const item = e.target.closest('.picker-item');
     if (!item || !activeModelPickerTarget) return;
-    const modelId = item.dataset.modelId;
-    selectModel(activeModelPickerTarget, modelId);
+    const pickedId = item.dataset.modelId;
+
+    if (pendingModelSessionId) {
+      const sid = pendingModelSessionId;
+      closeModelPicker();
+      let actualId = pickedId;
+      if (actualId) {
+        changeSessionModel(sid, actualId)
+          .then(() => toast('Model changed'))
+          .catch(err => toast(err.message, true));
+      }
+      return;
+    }
+
+    selectModel(activeModelPickerTarget, pickedId);
     closeModelPicker();
   });
 
@@ -1122,6 +1256,7 @@ function openNewModal() {
   document.getElementById('session-dir').style.display = 'none';
   document.getElementById('session-branch-custom').value = '';
   document.getElementById('session-branch-new').style.display = 'none';
+  document.getElementById('session-review').checked = false;
   renderDirSelect();
   openModal('new-modal');
 }
@@ -1292,6 +1427,496 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// --- Code review ---
+
+async function fetchReviewsList() {
+  try {
+    reviews = await api('/reviews') || [];
+  } catch {
+    reviews = [];
+  }
+}
+
+function upsertReview(v) {
+  const idx = reviews.findIndex(r => r.id === v.id);
+  if (idx >= 0) reviews[idx] = v;
+  else reviews.unshift(v);
+}
+
+function pendingReviews(sessionId) {
+  return reviews
+    .filter(r => r.status === 'pending' && (!sessionId || r.sessionId === sessionId))
+    .sort((a, b) => a.seq - b.seq);
+}
+
+function baseName(p) {
+  return (p || '').split('/').filter(Boolean).pop() || p;
+}
+
+function sessionName(id) {
+  const s = sessions.find(x => x.id === id);
+  return s ? s.name : '';
+}
+
+function renderReviewBell() {
+  const bell = document.getElementById('review-bell');
+  const count = pendingReviews().length;
+  bell.hidden = count === 0;
+  document.getElementById('review-bell-count').textContent = count;
+}
+
+function openNextPendingReview(sessionId) {
+  const next = pendingReviews(sessionId)[0];
+  if (next) openReviewScreen(next.id);
+  else toast('No pending reviews');
+}
+
+// syncReviewScreen keeps an open review screen honest when SSE reports the
+// displayed review changed (e.g. decided from another device) or new reviews
+// arrive for the same session (queue counter). Updates in place — a refetch
+// here would race the close-after-decide flow and reopen a closed screen.
+function syncReviewScreen(v) {
+  if (!activeReview || document.getElementById('review-screen').hidden) return;
+  if (v.id === activeReview.id) {
+    if (v.status !== activeReview.status) {
+      activeReview.status = v.status;
+      if (v.comments) activeReview.comments = v.comments;
+      rerenderReviewBodyPreservingScroll();
+      renderReviewFoot();
+    }
+    renderReviewNav();
+  } else {
+    renderReviewNav();
+  }
+}
+
+async function openReviewScreen(id) {
+  let full;
+  try {
+    full = await api('/reviews/' + id);
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  activeReview = full;
+  closeComposer();
+  renderReviewScreen();
+  const screen = document.getElementById('review-screen');
+  screen.hidden = false;
+  document.body.classList.add('modal-open');
+  screen.querySelector('.review-body').scrollTop = 0;
+}
+
+function closeReviewScreen() {
+  document.getElementById('review-screen').hidden = true;
+  activeReview = null;
+  closeComposer();
+  if (!document.querySelector('.modal.active')) {
+    document.body.classList.remove('modal-open');
+  }
+}
+
+function renderReviewScreen() {
+  const r = activeReview;
+  if (!r) return;
+
+  document.getElementById('review-file').textContent = baseName(r.filePath);
+  const verb = r.toolName === 'Write' ? (r.newFile ? 'create' : 'overwrite') : 'edit';
+  document.getElementById('review-sub').innerHTML =
+    `${esc(sessionName(r.sessionId) || r.sessionId)} · ${verb} · ` +
+    `<span class="stat-add">+${r.adds}</span> <span class="stat-del">−${r.dels}</span>`;
+
+  renderReviewNav();
+  renderReviewBody();
+  renderReviewFoot();
+}
+
+function renderReviewNav() {
+  const nav = document.getElementById('review-nav');
+  const r = activeReview;
+  if (!r) { nav.hidden = true; return; }
+  const queue = pendingReviews(r.sessionId);
+  const idx = queue.findIndex(q => q.id === r.id);
+  if (idx < 0 || queue.length < 2) {
+    nav.hidden = true;
+    return;
+  }
+  nav.hidden = false;
+  document.getElementById('review-pos').textContent = `${idx + 1}/${queue.length}`;
+  document.getElementById('review-prev').disabled = idx === 0;
+  document.getElementById('review-next').disabled = idx === queue.length - 1;
+}
+
+function reviewLang(path) {
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  const map = {
+    go: 'go', js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+    ts: 'typescript', tsx: 'typescript', py: 'python', rb: 'ruby', rs: 'rust',
+    c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', java: 'java', kt: 'kotlin',
+    swift: 'swift', sh: 'bash', bash: 'bash', zsh: 'bash', yaml: 'yaml', yml: 'yaml',
+    json: 'json', html: 'xml', xml: 'xml', css: 'css', scss: 'scss', md: 'markdown',
+    sql: 'sql', tf: 'ini', toml: 'ini', ini: 'ini', php: 'php', lua: 'lua',
+    dockerfile: 'dockerfile',
+  };
+  const lang = map[ext] || (baseName(path).toLowerCase() === 'dockerfile' ? 'dockerfile' : '');
+  return (lang && window.hljs && hljs.getLanguage(lang)) ? lang : '';
+}
+
+function highlightLine(text, lang) {
+  if (text === '') return '&nbsp;';
+  if (lang && window.hljs) {
+    try {
+      return hljs.highlight(text, { language: lang, ignoreIllegals: true }).value;
+    } catch { /* fall through */ }
+  }
+  return esc(text);
+}
+
+// commentKey anchors comments to diff rows: "g" for global, otherwise
+// side:line of the commented row.
+function commentKey(c) {
+  return c.line ? `${c.side || 'new'}:${c.line}` : 'g';
+}
+
+function rowKey(row) {
+  return row.t === 'del' ? `old:${row.o}` : `new:${row.n}`;
+}
+
+// rowTextByKey recovers a row's source text from the active review's hunks.
+// The text never rides on a DOM attribute — code routinely contains quotes.
+function rowTextByKey(rk) {
+  for (const h of (activeReview && activeReview.hunks) || []) {
+    for (const row of h.rows) {
+      if (rowKey(row) === rk) return row.text;
+    }
+  }
+  return '';
+}
+
+function renderReviewBody() {
+  const r = activeReview;
+  const body = document.getElementById('review-body');
+  const lang = reviewLang(r.filePath);
+  const pending = r.status === 'pending';
+
+  const byKey = new Map();
+  for (const c of r.comments || []) {
+    const k = commentKey(c);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(c);
+  }
+
+  const parts = [];
+
+  const flags = [];
+  if (r.newFile) flags.push('<span class="review-flag flag-new">new file</span>');
+  if (r.notebook) flags.push('<span class="review-flag flag-nb">notebook cell — new source shown</span>');
+  if (r.noMatch) flags.push('<span class="review-flag flag-warn">⚠️ edit pattern not found in the current file — claude\'s change will fail as-is</span>');
+  if (r.tooLarge) flags.push('<span class="review-flag flag-warn">file too large to render a diff — approve or deny blind, or check it on disk</span>');
+  if (flags.length) parts.push(`<div class="review-flags">${flags.join('')}</div>`);
+
+  const globals = byKey.get('g') || [];
+  if (globals.length) {
+    parts.push(`<div class="global-comments">${globals.map(c => commentCard(c, pending)).join('')}</div>`);
+  }
+
+  const hunks = r.hunks || [];
+  if (hunks.length === 0 && !r.tooLarge) {
+    parts.push('<div class="review-empty">No content changes to show.</div>');
+  }
+
+  // diff-wrap gives no-wrap mode one shared width (max-content), so row
+  // backgrounds stay uniform bands while the body scrolls horizontally.
+  if (hunks.length) parts.push('<div class="diff-wrap">');
+  hunks.forEach((h, hi) => {
+    if (hi > 0) parts.push('<div class="hunk-sep">···</div>');
+    parts.push('<div class="hunk">');
+    for (const row of h.rows) {
+      const k = rowKey(row);
+      const commented = byKey.has(k) ? 'commented' : '';
+      parts.push(
+        `<div class="drow t-${row.t} ${commented} ${pending ? 'tappable' : ''}" data-rk="${k}" data-line="${row.t === 'del' ? row.o : row.n}" data-side="${row.t === 'del' ? 'old' : 'new'}">` +
+          `<span class="ln">${row.o || ''}</span>` +
+          `<span class="ln">${row.n || ''}</span>` +
+          `<span class="dsign">${row.t === 'add' ? '+' : row.t === 'del' ? '−' : ''}</span>` +
+          `<code class="dcode">${highlightLine(row.text, lang)}</code>` +
+        `</div>`
+      );
+      if (byKey.has(k)) {
+        parts.push(`<div class="line-comments">${byKey.get(k).map(c => commentCard(c, pending)).join('')}</div>`);
+      }
+    }
+    parts.push('</div>');
+  });
+  if (hunks.length) parts.push('</div>');
+
+  body.innerHTML = parts.join('');
+  applyWrapPref();
+}
+
+// --- word wrap preference (cookie-persisted) ---
+
+function wrapEnabled() {
+  const m = document.cookie.match(/(?:^|;\s*)cp_wrap=(\d)/);
+  return m ? m[1] === '1' : true; // wrap on by default
+}
+
+function setWrapEnabled(on) {
+  document.cookie = 'cp_wrap=' + (on ? '1' : '0') + '; path=/; max-age=31536000; samesite=lax';
+  applyWrapPref();
+}
+
+function applyWrapPref() {
+  const on = wrapEnabled();
+  document.getElementById('review-body').classList.toggle('nowrap', !on);
+  const btn = document.getElementById('review-wrap');
+  btn.setAttribute('aria-pressed', String(on));
+  btn.classList.toggle('off', !on);
+}
+
+function commentCard(c, pending) {
+  const del = pending ? `<button class="comment-del" data-del-comment="${c.id}" aria-label="Delete comment">&times;</button>` : '';
+  const label = c.line ? '' : '<span class="comment-scope">overall</span>';
+  return `<div class="comment-card">${label}<p>${esc(c.text)}</p>${del}</div>`;
+}
+
+function renderReviewFoot() {
+  const r = activeReview;
+  const foot = document.getElementById('review-foot');
+  const bar = document.getElementById('review-decided-bar');
+  const pending = r.status === 'pending';
+  foot.hidden = !pending;
+  bar.hidden = pending;
+
+  if (!pending) {
+    const labels = {
+      approved: '✓ Approved',
+      denied: '✗ Denied — claude got your feedback',
+      cancelled: 'Cancelled — the session ended',
+    };
+    bar.textContent = labels[r.status] || r.status;
+    bar.className = 'review-decided-bar ' + r.status;
+    return;
+  }
+
+  const n = (r.comments || []).length;
+  const count = document.getElementById('review-comment-count');
+  count.hidden = n === 0;
+  count.textContent = n;
+  const deny = document.getElementById('review-deny');
+  deny.disabled = n === 0;
+  deny.title = n === 0 ? 'Add at least one comment first' : '';
+  document.getElementById('review-approve').textContent = n > 0 ? 'Approve w/ comments' : 'Approve';
+}
+
+// --- comment composer ---
+
+function openComposer(ctx) {
+  composerCtx = ctx;
+  const target = document.getElementById('composer-target');
+  if (ctx) {
+    target.innerHTML = `Line ${ctx.line} <code>${esc(ctx.lineText.trim().slice(0, 80))}</code>`;
+  } else {
+    target.textContent = 'Overall comment';
+  }
+  document.getElementById('composer-overlay').hidden = false;
+  const composer = document.getElementById('composer');
+  composer.hidden = false;
+  const text = document.getElementById('composer-text');
+  text.value = '';
+  setTimeout(() => text.focus(), 50);
+}
+
+function closeComposer() {
+  document.getElementById('composer').hidden = true;
+  document.getElementById('composer-overlay').hidden = true;
+  composerCtx = null;
+}
+
+async function saveComposerComment() {
+  const text = document.getElementById('composer-text').value.trim();
+  if (!text || !activeReview) return;
+  const body = composerCtx
+    ? { line: composerCtx.line, side: composerCtx.side, lineText: composerCtx.lineText, text }
+    : { text };
+  try {
+    const c = await api('/reviews/' + activeReview.id + '/comments', { method: 'POST', body: JSON.stringify(body) });
+    activeReview.comments = [...(activeReview.comments || []), c];
+    closeComposer();
+    rerenderReviewBodyPreservingScroll();
+    renderReviewFoot();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function rerenderReviewBodyPreservingScroll() {
+  const body = document.getElementById('review-body');
+  const top = body.scrollTop;
+  renderReviewBody();
+  body.scrollTop = top;
+}
+
+async function decideReview(action) {
+  if (!activeReview) return;
+  const id = activeReview.id;
+  const sessionId = activeReview.sessionId;
+  try {
+    await api('/reviews/' + id + '/decision', { method: 'POST', body: JSON.stringify({ action }) });
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  const idx = reviews.findIndex(r => r.id === id);
+  if (idx >= 0) reviews[idx].status = action === 'approve' ? 'approved' : 'denied';
+  render();
+  toast(action === 'approve' ? 'Approved — claude is writing it' : 'Denied — claude got your comments');
+
+  const next = pendingReviews(sessionId)[0];
+  if (next) openReviewScreen(next.id);
+  else closeReviewScreen();
+}
+
+function bindReviewEvents() {
+  document.getElementById('review-bell').addEventListener('click', () => openNextPendingReview());
+  document.getElementById('review-back').addEventListener('click', closeReviewScreen);
+  document.getElementById('review-wrap').addEventListener('click', () => setWrapEnabled(!wrapEnabled()));
+  document.getElementById('review-approve').addEventListener('click', () => decideReview('approve'));
+  document.getElementById('review-deny').addEventListener('click', () => decideReview('deny'));
+  document.getElementById('review-global-btn').addEventListener('click', () => openComposer(null));
+  document.getElementById('composer-cancel').addEventListener('click', closeComposer);
+  document.getElementById('composer-overlay').addEventListener('click', closeComposer);
+  document.getElementById('composer-save').addEventListener('click', saveComposerComment);
+
+  document.getElementById('review-prev').addEventListener('click', () => stepReview(-1));
+  document.getElementById('review-next').addEventListener('click', () => stepReview(1));
+
+  document.getElementById('review-body').addEventListener('click', (e) => {
+    const del = e.target.closest('[data-del-comment]');
+    if (del && activeReview) {
+      api('/reviews/' + activeReview.id + '/comments/' + del.dataset.delComment, { method: 'DELETE' })
+        .then(() => {
+          activeReview.comments = (activeReview.comments || []).filter(c => c.id !== del.dataset.delComment);
+          rerenderReviewBodyPreservingScroll();
+          renderReviewFoot();
+        })
+        .catch(err => toast(err.message, true));
+      return;
+    }
+    const row = e.target.closest('.drow.tappable');
+    if (row) {
+      openComposer({
+        line: parseInt(row.dataset.line, 10),
+        side: row.dataset.side,
+        lineText: rowTextByKey(row.dataset.rk),
+      });
+    }
+  });
+
+  // iOS suspends background PWAs: the EventSource dies silently and its
+  // 3s reconnect timer doesn't run until the app is foregrounded again.
+  // Refetch reviews immediately on resume so pending work shows up without
+  // waiting on the reconnect (which then refreshes sessions via init).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && appStarted) {
+      fetchReviewsList().then(render);
+    }
+  });
+
+  // Push notification taps land here when the app is already open.
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'open-url') {
+        const id = new URLSearchParams((e.data.url.split('?')[1] || '')).get('review');
+        if (id) openReviewScreen(id);
+      }
+    });
+  }
+}
+
+function stepReview(delta) {
+  if (!activeReview) return;
+  const queue = pendingReviews(activeReview.sessionId);
+  const idx = queue.findIndex(q => q.id === activeReview.id);
+  const next = queue[idx + delta];
+  if (next) openReviewScreen(next.id);
+}
+
+// --- web push ---
+
+function pushSupported() {
+  return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+}
+
+function isIOS() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent);
+}
+
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+async function initPush() {
+  if (!pushSupported()) return;
+  try {
+    await navigator.serviceWorker.register('/sw.js');
+  } catch (err) {
+    console.warn('sw register failed', err);
+  }
+}
+
+async function currentPushSubscription() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return null;
+  return reg.pushManager.getSubscription();
+}
+
+async function renderPushState() {
+  const toggle = document.getElementById('push-enabled');
+  const hint = document.getElementById('push-hint');
+  const defaultHint = 'Get notified when a code review is waiting. Changes apply immediately — not on Save.';
+
+  if (!pushSupported()) {
+    toggle.checked = false;
+    toggle.disabled = true;
+    hint.textContent = isIOS() && !isStandalone()
+      ? 'On iPhone: open the share menu → Add to Home Screen, then enable this from the installed app.'
+      : 'Push notifications are not supported in this browser.';
+    return;
+  }
+  toggle.disabled = false;
+  hint.textContent = defaultHint;
+  toggle.checked = !!(await currentPushSubscription());
+}
+
+function urlBase64ToUint8Array(base64) {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64);
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+}
+
+async function enablePush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error('Notifications were not allowed');
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  await navigator.serviceWorker.ready;
+  const { key } = await api('/push/key');
+  const sub = await reg.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(key),
+  });
+  await api('/push/subscribe', { method: 'POST', body: JSON.stringify(sub.toJSON()) });
+}
+
+async function disablePush() {
+  const sub = await currentPushSubscription();
+  if (!sub) return;
+  await api('/push/unsubscribe', { method: 'POST', body: JSON.stringify({ endpoint: sub.endpoint }) });
+  await sub.unsubscribe();
 }
 
 // Update time-ago every 30s

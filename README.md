@@ -33,6 +33,8 @@ The whole point: you're on the couch, you have an idea, you pull out your phone,
 - **📡 Live session dashboard** — every session with a real-time status dot (starting / active / dead), driven by Server-Sent Events. No refresh button.
 - **🔁 Restart-proof sessions** — each session runs under a tiny detached shim process that owns its PTY, so restarting (or upgrading) couchpilot never touches a running session. On startup couchpilot re-adopts every session whose shim is still alive.
 - **⏪ Resumable sessions** — dead sessions keep their conversation id and get a **Resume** button: the conversation picks up exactly where it left off, re-registered with Remote Control under the same name.
+- **🔍 Full code review** — opt a session into review mode and every file change Claude attempts is held for your approval first: a syntax-highlighted diff on your phone, tap-to-comment on any line, overall comments, and **Approve** / **Request changes**. Denials feed your comments straight back to Claude, which revises and resubmits.
+- **🔔 Push notifications** — get a tappable notification when a review is waiting (requires HTTPS; on iOS, install the app to your home screen first).
 - **💬 iMessage channels** — keep a dedicated session alive that bridges iMessage to Claude Code. If it crashes, it auto-resumes with its conversation context intact; the Restart button starts it fresh. Text your agents.
 - **🔐 Password authentication** — on by default, with a one-tap setup. Disable it for a trusted private network if you prefer.
 - **📁 Project roots & favorites** — point couchpilot at the folders where your projects live; they show up in the picker with branch, ahead/behind, and dirty-file counts.
@@ -218,10 +220,41 @@ The **gear** opens settings, organized into sections:
 - **Session Defaults** — permission mode, model, effort.
 - **Projects** — manage project roots and favorite directories.
 - **Channels** — enable/configure the iMessage channels session.
+- **Notifications** — enable push notifications on this device.
 - **Security** — password and auth toggle.
 - **Claude Account** — run `claude login` from the browser.
 
-Changes are staged and applied on **Save** (except Security, which applies immediately).
+Changes are staged and applied on **Save** (except Notifications and Security, which apply immediately).
+
+---
+
+## Code review
+
+Flip **Full code review** on when creating a session (or any time from the session card — it takes effect on the session's next file write, no restart needed). From then on, every `Write`/`Edit`/`NotebookEdit` the session attempts is intercepted **before it touches disk** and shows up as a pending review:
+
+- The session card (and the header) get a **pending review badge**; tap it to open the review.
+- The review screen shows a syntax-highlighted, mobile-friendly diff of exactly what Claude wants to change — additions, deletions, and context with both old and new line numbers. New files, oversized files, and edits whose target text no longer matches the file are flagged.
+- **Tap any line** to attach a comment to it. The speech-bubble button adds an overall comment. Comments can be deleted until you decide.
+- Long lines wrap by default; the **word-wrap toggle** in the header switches to horizontal scrolling with pinned line numbers instead (remembered per device).
+- **Approve** lets the write proceed exactly as proposed. With comments attached it becomes *Approve w/ comments*: the change is written and your notes are delivered to Claude as follow-up context.
+- **Deny** (requires at least one comment — Claude needs something to act on) blocks the write and hands Claude your comments, quoted line by line. Claude revises and the next attempt comes back as a fresh review.
+- Multiple pending reviews queue per session; arrows in the header step through them, and deciding one auto-advances to the next.
+
+While a review is pending, Claude is genuinely blocked mid-tool-call — it waits as long as you take. Pending reviews survive couchpilot restarts (the hook reconnects on its own), and reviews for a session that dies are cancelled.
+
+**Scope honesty:** the gate covers the file tools. Changes made through `Bash` (heredocs, `sed -i`, `git apply`, generators) never pass through the hook, so review mode is a workflow for reviewing Claude's edits — not a security boundary against a malicious agent.
+
+---
+
+## Push notifications
+
+Enable **Settings → Notifications** to get a push when a review is waiting; tapping it deep-links straight into that review. Notifications are per-device subscriptions (VAPID web push, generated and stored locally — no third-party service).
+
+The browser rules that apply:
+
+- **HTTPS is required.** Service workers and web push only run on a secure origin, so put couchpilot behind whatever TLS-terminating proxy you prefer. Plain `http://host:7080` works fine for everything else, but the Notifications toggle will be unavailable.
+- **iOS requires an installed PWA.** In Safari: share menu → **Add to Home Screen**, open couchpilot from the icon, then enable notifications in Settings. iOS 16.4+.
+- The service worker is push-only — it deliberately does **no** asset caching, so deploys never serve a stale app.
 
 ---
 
@@ -293,6 +326,14 @@ couchpilot watches each shim's state file and pid, broadcasts changes to every b
 
 Because couchpilot always knows each session's conversation id, a dead session can be **resumed**: `claude --remote-control <name> --resume <uuid>` restores the full conversation and re-registers with Remote Control. Dead sessions stay listed (and resumable) for 24 hours.
 
+### The review gate
+
+Every session is spawned with a generated `--settings` file that wires Claude Code's `PreToolUse`/`PostToolUse` hooks for the file tools to `couchpilot _hook` (the same binary again). The hook is always installed but asks couchpilot whether the session has review mode on — off means an instant allow (~ms), which is why the toggle works mid-session without a respawn.
+
+When review mode is on, the hook submits the tool call to couchpilot, which reads the target file, computes the proposed result (applying `Edit` replacements server-side), and stores a pending review. The hook then long-polls for the verdict — for hours if needed (its configured hook timeout is a day) — while Claude stays blocked inside the tool call. Approval returns `permissionDecision: allow` and the original write proceeds untouched; denial returns the review comments as the decision reason, which Claude receives as the tool failure and iterates on. Approve-with-comments lets the write through and delivers the notes via the `PostToolUse` hook's `additionalContext`, matched by `tool_use_id`.
+
+Hook endpoints authenticate with a dedicated secret (`hook-secret`, passed to sessions via the environment) rather than the UI session cookie. Pending reviews persist to disk, so a couchpilot restart mid-review just looks like a slow poll to the waiting hook. Hook decisions apply even in `bypassPermissions` sessions — hooks sit below the permission system.
+
 ### State & files
 
 | Path | Purpose |
@@ -300,7 +341,9 @@ Because couchpilot always knows each session's conversation id, a dead session c
 | `~/.config/couchpilot/config.json` | Configuration. |
 | `~/.config/couchpilot/auth.json` | Password hash + signing secret (`0600`). |
 | `~/.config/couchpilot/sessions.json` | Persisted session metadata. |
-| `~/.config/couchpilot/sessions/<id>/` | Per-session shim state: `state.json`, `tail.log` (last 64 KB of output), `shim.log`. Removed when the session is dismissed or ages out. |
+| `~/.config/couchpilot/sessions/<id>/` | Per-session shim state: `state.json`, `tail.log` (last 64 KB of output), `shim.log`, `hooks.json` (generated hook settings), `reviews.json` (review history, capped). Removed when the session is dismissed or ages out. |
+| `~/.config/couchpilot/hook-secret` | Shared secret authenticating `_hook` processes to the local API (`0600`). |
+| `~/.config/couchpilot/push.json` | VAPID key pair + push subscriptions (`0600`). |
 | `~/.config/couchpilot/stdout.log`, `stderr.log` | LaunchAgent logs. |
 | `~/Library/LaunchAgents/com.couchpilot.server.plist` | macOS service definition. |
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,7 @@ type Session struct {
 	Channels       string        `json:"channels,omitempty"`
 	PluginDirs     []string      `json:"pluginDirs,omitempty"`
 	IsChannels     bool          `json:"isChannels"`
+	ReviewMode     bool          `json:"reviewMode"`        // gate file writes behind code review
 	Discard        bool          `json:"discard,omitempty"` // deliberately restarted: don't auto-resume
 	CreatedAt      time.Time     `json:"createdAt"`
 	DiedAt         *time.Time    `json:"diedAt,omitempty"`
@@ -62,6 +64,21 @@ type SessionManager struct {
 	hub            *SSEHub
 	dataDir        string
 	onChannelsDied func()
+
+	// onSessionDied/onSessionDismissed let the review manager resolve pending
+	// reviews for sessions that go away; hookPort/hookToken flow to spawned
+	// claude processes so their hooks can call back into this couchpilot.
+	onSessionDied      func(id string)
+	onSessionDismissed func(id string)
+	hookPort           int
+	hookToken          string
+}
+
+// SetHookEnv provides the local API coordinates the review hook needs; it
+// must be called before any session spawns.
+func (sm *SessionManager) SetHookEnv(port int, token string) {
+	sm.hookPort = port
+	sm.hookToken = token
 }
 
 func NewSessionManager(dataDir string, hub *SSEHub) *SessionManager {
@@ -88,6 +105,7 @@ type CreateSessionOpts struct {
 	Channels     string
 	PluginDirs   []string
 	IsChannels   bool
+	ReviewMode   bool
 	Branch       string
 	CreateBranch bool
 	BranchFrom   string
@@ -133,6 +151,7 @@ func (sm *SessionManager) CreateSession(opts CreateSessionOpts) (*Session, error
 		Channels:       opts.Channels,
 		PluginDirs:     opts.PluginDirs,
 		IsChannels:     opts.IsChannels,
+		ReviewMode:     opts.ReviewMode,
 		CreatedAt:      time.Now(),
 	}
 	// The RC TUI no longer prints its URL, but it is deterministic from the
@@ -225,15 +244,29 @@ func (sm *SessionManager) spawnShim(s *Session, resume bool) error {
 	os.Remove(filepath.Join(stateDir, shimStateFile))
 	os.Remove(filepath.Join(stateDir, shimTailFile))
 
+	// The review hook is wired into every session via a generated settings
+	// file; whether it actually gates anything is decided server-side per
+	// session, so review mode can be toggled mid-session without a respawn.
+	settingsPath := filepath.Join(stateDir, "hooks.json")
+	if err := writeHookSettings(settingsPath, self); err != nil {
+		return err
+	}
+
 	args := []string{"_shim", "-state", stateDir}
 	if s.PermissionMode == "bypassPermissions" {
 		args = append(args, "-accept-bypass")
 	}
 	args = append(args, "--", claudePath)
 	args = append(args, buildClaudeArgs(s, resume)...)
+	args = append(args, "--settings", settingsPath)
 
 	cmd := exec.Command(self, args...)
 	cmd.Dir = s.Dir
+	cmd.Env = append(os.Environ(),
+		"COUCHPILOT_SESSION_ID="+s.ID,
+		fmt.Sprintf("COUCHPILOT_PORT=%d", sm.hookPort),
+		"COUCHPILOT_HOOK_TOKEN="+sm.hookToken,
+	)
 	logf, err := os.OpenFile(filepath.Join(stateDir, shimLogFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		defer logf.Close()
@@ -251,6 +284,132 @@ func (sm *SessionManager) spawnShim(s *Session, resume bool) error {
 	s.ShimPID = cmd.Process.Pid
 	sm.mu.Unlock()
 	return nil
+}
+
+// writeHookSettings generates the per-session claude settings file that wires
+// the file tools through `couchpilot _hook`. The PreToolUse timeout is a day:
+// the hook legitimately blocks for as long as a human takes to review.
+func writeHookSettings(path, exe string) error {
+	type hookCmd struct {
+		Type    string `json:"type"`
+		Command string `json:"command"`
+		Timeout int    `json:"timeout"`
+	}
+	type hookMatcher struct {
+		Matcher string    `json:"matcher"`
+		Hooks   []hookCmd `json:"hooks"`
+	}
+	settings := map[string]map[string][]hookMatcher{
+		"hooks": {
+			"PreToolUse": {{
+				Matcher: "Write|Edit|MultiEdit|NotebookEdit",
+				Hooks:   []hookCmd{{Type: "command", Command: fmt.Sprintf("%q _hook pre", exe), Timeout: 86400}},
+			}},
+			"PostToolUse": {{
+				Matcher: "Write|Edit|MultiEdit|NotebookEdit",
+				Hooks:   []hookCmd{{Type: "command", Command: fmt.Sprintf("%q _hook post", exe), Timeout: 30}},
+			}},
+		},
+	}
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// SetReviewMode flips the code-review gate for a running session. The hook is
+// always installed, so this takes effect on the session's next file write.
+func (sm *SessionManager) SetReviewMode(id string, on bool) error {
+	sm.mu.Lock()
+	s, ok := sm.sessions[id]
+	if !ok {
+		sm.mu.Unlock()
+		return os.ErrNotExist
+	}
+	s.ReviewMode = on
+	snap := *s
+	sm.mu.Unlock()
+	sm.persist()
+	sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+	return nil
+}
+
+// SendInput writes data to a running session's PTY via the shim's Unix socket.
+func (sm *SessionManager) SendInput(id, input string) error {
+	sockPath := filepath.Join(sm.stateDir(id), shimInputSocket)
+	conn, err := net.DialTimeout("unix", sockPath, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect to session input: %w", err)
+	}
+	defer conn.Close()
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write([]byte(input))
+	return err
+}
+
+// ChangeModel restarts a running session with a different model. The session is
+// killed and resumed with --model <modelID>, preserving conversation history.
+// modelID is a Claude model identifier (e.g. "claude-opus-4-6", "sonnet").
+func (sm *SessionManager) ChangeModel(id, modelID string) error {
+	sm.mu.Lock()
+	s, ok := sm.sessions[id]
+	if !ok {
+		sm.mu.Unlock()
+		return os.ErrNotExist
+	}
+	if s.Status == StatusDead {
+		sm.mu.Unlock()
+		return errors.New("session is dead")
+	}
+	if s.SessionUUID == "" {
+		sm.mu.Unlock()
+		return errors.New("session has no conversation id")
+	}
+
+	oldShimPID := s.ShimPID
+	s.Model = modelID
+	s.Status = StatusStarting
+	s.PID = 0
+	s.ShimPID = 0
+	s.gen++
+	sm.mu.Unlock()
+
+	if oldShimPID > 0 && pidAlive(oldShimPID) {
+		syscall.Kill(oldShimPID, syscall.SIGTERM)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && pidAlive(oldShimPID) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if pidAlive(oldShimPID) {
+			syscall.Kill(oldShimPID, syscall.SIGKILL)
+		}
+	}
+
+	if err := sm.spawnShim(s, true); err != nil {
+		sm.markDead(id)
+		return fmt.Errorf("respawn with new model: %w", err)
+	}
+
+	sm.mu.RLock()
+	snap := *s
+	gen := s.gen
+	sm.mu.RUnlock()
+	sm.persist()
+	sm.hub.Broadcast(SSEEvent{Type: "session_updated", Data: &snap})
+
+	go sm.watchSession(s, gen)
+
+	return nil
+}
+
+// ReviewModeOn reports whether a session currently has the review gate on —
+// the hook asks this (via the server) on every file write.
+func (sm *SessionManager) ReviewModeOn(id string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	s, ok := sm.sessions[id]
+	return ok && s.ReviewMode
 }
 
 func buildClaudeArgs(s *Session, resume bool) []string {
@@ -408,6 +567,9 @@ func (sm *SessionManager) DismissSession(id string) {
 	sm.mu.Unlock()
 	if ok {
 		os.RemoveAll(sm.stateDir(id))
+		if sm.onSessionDismissed != nil {
+			sm.onSessionDismissed(id)
+		}
 	}
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_dismissed", Data: map[string]string{"id": id}})
@@ -443,6 +605,9 @@ func (sm *SessionManager) markDead(id string) {
 	sm.persist()
 	sm.hub.Broadcast(SSEEvent{Type: "session_died", Data: &snap})
 
+	if sm.onSessionDied != nil {
+		sm.onSessionDied(id)
+	}
 	if isChannels && sm.onChannelsDied != nil {
 		go func() {
 			time.Sleep(3 * time.Second)
