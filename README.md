@@ -1,10 +1,22 @@
 <div align="center">
 
-# 🛋️ couchpilot
+<img src="static/icons/icon-512.png" alt="couchpilot logo" width="140">
+
+# couchpilot
 
 **The ultimate mobile vibe-coding cockpit for [Claude Code](https://www.anthropic.com/claude-code).**
 
 Launch, monitor, and steer Claude Code remote-control sessions from your phone, tablet, or any browser — without ever opening a terminal. Built for the couch.
+
+<p>
+  <img src="docs/screenshots/review-diff.png" alt="Code review diff on a phone" width="220">
+  &nbsp;
+  <img src="docs/screenshots/review-comment.png" alt="Tap a line to comment on a review" width="220">
+  &nbsp;
+  <img src="docs/screenshots/model-picker.png" alt="Live model picker" width="220">
+</p>
+
+<sub><b>Code review on your phone</b> · tap-to-comment diffs · live model picker — all from the couch.</sub>
 
 </div>
 
@@ -19,7 +31,7 @@ couchpilot is the missing front end. It's a tiny Go service that runs on your de
 - spin up new Claude Code sessions with the model, effort, permission mode, working directory, and git branch you want — all from a thumb-friendly sheet,
 - see every running and recently-ended session at a glance, with live status,
 - jump straight into any session in the Claude app, or kill it, with one tap,
-- keep a persistent "channels" session alive that bridges **iMessage → Claude Code**, so you can text your agents.
+- keep a persistent **channels** session alive that bridges a messaging channel (iMessage, or any Claude Code channel plugin) to your agents, so you can message them.
 
 The whole point: you're on the couch, you have an idea, you pull out your phone, and thirty seconds later an agent is working on it. That's the vibe.
 
@@ -35,10 +47,10 @@ The whole point: you're on the couch, you have an idea, you pull out your phone,
 - **⏪ Resumable sessions** — dead sessions keep their conversation id and get a **Resume** button: the conversation picks up exactly where it left off, re-registered with Remote Control under the same name.
 - **🔍 Full code review** — opt a session into review mode and every file change Claude attempts is held for your approval first: a syntax-highlighted diff on your phone, tap-to-comment on any line, overall comments, and **Approve** / **Request changes**. Denials feed your comments straight back to Claude, which revises and resubmits.
 - **🔔 Push notifications** — get a tappable notification when a review is waiting (requires HTTPS; on iOS, install the app to your home screen first).
-- **💬 iMessage channels** — keep a dedicated session alive that bridges iMessage to Claude Code. If it crashes, it auto-resumes with its conversation context intact; the Restart button starts it fresh. Text your agents.
+- **💬 Channels** — keep a dedicated session alive that bridges a Claude Code **channel** to your agents, so you can message them (iMessage is one plugin; any channel plugin works). If it crashes, it auto-resumes with its conversation context intact; the Restart button starts it fresh.
 - **🔐 Password authentication** — on by default, with a one-tap setup. Disable it for a trusted private network if you prefer.
 - **📁 Project roots & favorites** — point couchpilot at the folders where your projects live; they show up in the picker with branch, ahead/behind, and dirty-file counts.
-- **🧠 Live model catalog** — the model picker is populated from the latest Claude models, with aliases and a custom-ID escape hatch.
+- **🧠 Live model catalog & mid-session switching** — the model picker is populated from the latest Claude models, with aliases and a custom-ID escape hatch. Switch the model on a **running** session too — couchpilot relaunches it on the new model with the conversation intact.
 - **🔑 Built-in `claude login`** — authenticate Claude Code from the UI via an interactive pseudo-terminal, complete with on-screen arrow/enter/esc keys.
 - **🍎 Runs as a macOS service** — one command installs a LaunchAgent that starts on boot and stays up.
 - **🧹 Clean process management** — sessions run in their own process group, so killing one reaps its whole child tree (node, MCP servers) instead of orphaning it.
@@ -171,7 +183,7 @@ Config lives at `~/.config/couchpilot/config.json` and is created with sensible 
 | `defaultPermissionMode` | string | `"bypassPermissions"` | Default Claude permission mode (see below). |
 | `defaultModel` | string | `""` | Default model ID (empty = Claude Code's default). |
 | `defaultEffort` | string | `""` | Default effort level (`max`, `xhigh`, `high`, `medium`, `low`, or empty). |
-| `channelsEnabled` | bool | `false` | Auto-start and supervise the iMessage channels session. |
+| `channelsEnabled` | bool | `false` | Auto-start and supervise the channels session. |
 | `defaultChannels` | string | `""` | Channel identifier passed to `--channels`. |
 | `pluginDirs` | string[] | — | Local plugin directories loaded via `--plugin-dir` on the channels session. |
 | `authEnabled` | bool | `true` | Require a password to use the UI. |
@@ -209,9 +221,16 @@ Tap **Launch**. couchpilot picks a conversation id for the session, spawns the `
 Tap a session card to expand it:
 
 - **Open in Claude** — jumps to the session in the Claude app / claude.ai.
+- **Model** — switch the model on a running session. couchpilot relaunches `claude` on the new model under the same conversation id, so the context carries over (handy from a phone, where the Claude app has no model switcher).
 - **Kill** — terminates the session (and its child processes).
 - **Resume** — on a dead session: relaunches `claude --resume` with the same conversation, name, and settings. Sessions that never exchanged a message have nothing on disk to resume and report an error instead; sessions created before resume support don't show the button.
 - **Dismiss** — clears a dead session from the list.
+
+<div align="center">
+  <img src="docs/screenshots/claude-app-sessions.png" alt="couchpilot sessions connected in the Claude app" width="240">
+  <br>
+  <sub>Sessions couchpilot launched, live in the Claude app — one tap from the dashboard.</sub>
+</div>
 
 ### Settings
 
@@ -219,7 +238,7 @@ The **gear** opens settings, organized into sections:
 
 - **Session Defaults** — permission mode, model, effort.
 - **Projects** — manage project roots and favorite directories.
-- **Channels** — enable/configure the iMessage channels session.
+- **Channels** — enable/configure the channels session.
 - **Notifications** — enable push notifications on this device.
 - **Security** — password and auth toggle.
 - **Claude Account** — run `claude login` from the browser.
@@ -250,6 +269,12 @@ While a review is pending, Claude is genuinely blocked mid-tool-call — it wait
 
 Enable **Settings → Notifications** to get a push when a review is waiting; tapping it deep-links straight into that review. Notifications are per-device subscriptions (VAPID web push, generated and stored locally — no third-party service).
 
+<div align="center">
+  <img src="docs/screenshots/push-notification.png" alt="Code review push notification" width="240">
+  <br>
+  <sub>A push lands the moment a review is waiting — tap it to jump straight in.</sub>
+</div>
+
 The browser rules that apply:
 
 - **HTTPS is required.** Service workers and web push only run on a secure origin, so put couchpilot behind whatever TLS-terminating proxy you prefer. Plain `http://host:7080` works fine for everything else, but the Notifications toggle will be unavailable.
@@ -258,11 +283,13 @@ The browser rules that apply:
 
 ---
 
-## iMessage channels
+## Channels
 
-couchpilot can keep a dedicated **channels** session alive that bridges iMessage to Claude Code. With `channelsEnabled: true`, it spawns the session on startup and auto-restarts it if it dies. Enable and configure it under **Settings → Channels**.
+Claude Code's **channels** bridge a messaging surface to an agent through a channel plugin. couchpilot can keep a dedicated **channels** session alive for whichever channel you configure (passed through as `--channels <identifier>`): with `channelsEnabled: true` it spawns the session on startup and auto-restarts it if it dies. Enable and configure it under **Settings → Channels**.
 
-### Using a forked iMessage plugin
+Any Claude Code channel plugin works — set `defaultChannels` to its identifier and (for a local plugin) point `pluginDirs` at its source. The walkthrough below uses **iMessage** as a concrete example because it's a forked plugin and needs the extra registration steps; an official/published channel plugin only needs its identifier.
+
+### Example: using a forked iMessage plugin
 
 To use a fork (e.g. `imessage@theoutdoorprogrammer` instead of the official `imessage@claude-plugins-official`), three things are required:
 
@@ -375,7 +402,10 @@ For access from anywhere — or to avoid exposing it on a shared LAN — put you
 go build -o couchpilot . && ./couchpilot            # build & run
 COUCHPILOT_CONFIG_DIR=/tmp/cp-dev ./couchpilot -port 7099  # isolated dev instance
 go vet ./... && gofmt -l .                           # lint
+go test -race ./...                                  # tests (race detector)
 ```
+
+Tests run in CI on every pull request and push to `main` (`.github/workflows/test.yml`: gofmt, vet, build, `go test -race`).
 
 Per-session output lives in `~/.config/couchpilot/sessions/<id>/tail.log` (rolling, bounded), which replaces the old `COUCHPILOT_DEBUG` firehose.
 
@@ -387,14 +417,18 @@ The web UI lives in `static/` and is embedded into the binary at build time, so 
 | --- | --- |
 | `main.go` | CLI entry point, LaunchAgent install/uninstall, version. |
 | `server.go` | HTTP server, routes, SSE hub, auth middleware, config API. |
-| `session.go` | Session lifecycle — shim spawn, state watching, resume, persistence. |
-| `shim.go` | Detached per-session PTY owner — output scanning, state file, signal forwarding. |
+| `session.go` | Session lifecycle — shim spawn, state watching, resume, model switch, persistence. |
+| `shim.go` | Detached per-session PTY owner — output scanning, state file, input socket, signal forwarding. |
+| `review.go` | Code-review state machine, diff engine, and persistence. |
+| `hook.go` | `couchpilot _hook` — the `PreToolUse`/`PostToolUse` bridge that gates file writes. |
+| `push.go` | VAPID web-push key management, subscriptions, and delivery. |
 | `auth.go` | Password hashing, signed cookie tokens, auth storage. |
 | `config.go` | Config load/save. |
 | `login.go` | Interactive `claude login` over a PTY. |
 | `projects.go` | Project discovery + cached git status. |
 | `models.go` | Live Claude model catalog. |
 | `static/` | Embedded SPA (`index.html`, `app.js`, `style.css`). |
+| `*_test.go` | Unit tests (run with `go test -race ./...`). |
 
 ---
 
@@ -407,7 +441,7 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which cross-compiles macOS and Linux binaries (amd64 + arm64), archives them with checksums, and publishes a GitHub Release. Validate the config locally with `goreleaser check` or do a dry run with `goreleaser release --snapshot --clean`.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which **runs the full test suite first** and only proceeds if it passes, then cross-compiles macOS and Linux binaries (amd64 + arm64), archives them with checksums, and publishes a GitHub Release. Validate the config locally with `goreleaser check` or do a dry run with `goreleaser release --snapshot --clean`.
 
 ---
 
