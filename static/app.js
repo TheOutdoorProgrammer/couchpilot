@@ -1636,7 +1636,9 @@ function renderReviewBody() {
   if (segments.length) parts.push('<div class="diff-wrap">');
   segments.forEach((seg, si) => {
     if (seg.kind === 'gap') {
-      parts.push(renderGap(seg, si, byKey, pending, lang));
+      // A gap's position decides which way it can expand: the first segment is
+      // the top of the file, the last is the bottom, anything else is interior.
+      parts.push(renderGap(seg, si, byKey, pending, lang, si === 0, si === segments.length - 1));
       return;
     }
     parts.push('<div class="hunk">');
@@ -1667,49 +1669,65 @@ function renderRow(row, byKey, pending, lang) {
   return html;
 }
 
-// renderGap renders a collapsed run of unchanged context: rows already revealed
-// from the top, an expand bar for whatever's still hidden, then rows revealed
-// from the bottom. Tapping ⌃/⌄ peels GAP_CHUNK lines off each end; the middle
-// count expands the whole gap. Revealed lines are ordinary context rows, so
-// they stay tappable for comments like any other line.
-function renderGap(seg, si, byKey, pending, lang) {
+// renderGap renders a collapsed run of unchanged context: any rows already
+// revealed from the top, a GitHub-style expander for whatever is still hidden,
+// then any rows revealed from the bottom. Revealed lines are ordinary context
+// rows, so they stay tappable for comments like any other line.
+function renderGap(seg, si, byKey, pending, lang, isTop, isBottom) {
   const rows = seg.rows;
-  const st = gapState[si] || { up: 0, down: 0 };
-  const up = Math.min(st.up, rows.length);
-  const down = Math.min(st.down, rows.length - up);
-  const hidden = rows.length - up - down;
+  const st = gapState[si] || { top: 0, bottom: 0 };
+  const top = Math.min(st.top, rows.length);
+  const bottom = Math.min(st.bottom, rows.length - top);
+  const hidden = rows.length - top - bottom;
 
   const out = [];
-  for (let i = 0; i < up; i++) out.push(renderRow(rows[i], byKey, pending, lang));
-  if (hidden > 0) {
-    out.push(
-      `<div class="diff-gap" role="group" aria-label="${hidden} hidden lines">` +
-        `<button class="gap-chev" data-gap="${si}" data-dir="up" aria-label="Reveal lines below the change above">⌃</button>` +
-        `<button class="gap-count" data-gap="${si}" data-dir="all">↕ ${hidden} ${hidden === 1 ? 'line' : 'lines'}</button>` +
-        `<button class="gap-chev" data-gap="${si}" data-dir="down" aria-label="Reveal lines above the change below">⌄</button>` +
-      `</div>`
-    );
-  }
-  for (let i = rows.length - down; i < rows.length; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  for (let i = 0; i < top; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  if (hidden > 0) out.push(gapBar(si, hidden, isTop, isBottom));
+  for (let i = rows.length - bottom; i < rows.length; i++) out.push(renderRow(rows[i], byKey, pending, lang));
   return out.join('');
 }
 
-// expandGap peels more context into view. "up"/"down" reveal GAP_CHUNK lines
-// from the top/bottom of the collapsed run; "all" reveals the whole gap. State
-// is keyed by segment index and reapplied on every render, so expansions
-// survive the in-place re-renders triggered by comments and SSE updates.
+// gapBar is the expand control, modeled on GitHub's. A small gap collapses to a
+// single "expand all" button; a larger one shows directional chevrons whose set
+// depends on position — the top-of-file gap only expands up (toward line 1), the
+// bottom-of-file gap only down (toward the end), and interior gaps both ways.
+// The count, tapped, always reveals the whole gap at once.
+function gapBar(si, hidden, isTop, isBottom) {
+  const plural = hidden === 1 ? 'line' : 'lines';
+  if (hidden <= GAP_CHUNK) {
+    return `<div class="diff-gap">` +
+      `<button class="gap-all" data-gap="${si}" data-dir="all" aria-label="Expand ${hidden} hidden ${plural}">` +
+        `<span class="gap-ico">↕</span><span class="gap-text">Expand ${hidden} ${plural}</span>` +
+      `</button></div>`;
+  }
+  const up = isBottom ? '' :
+    `<button class="gap-chev" data-gap="${si}" data-dir="up" aria-label="Expand up">⌃</button>`;
+  const down = isTop ? '' :
+    `<button class="gap-chev" data-gap="${si}" data-dir="down" aria-label="Expand down">⌄</button>`;
+  return `<div class="diff-gap">` +
+    `<span class="gap-chevs">${up}${down}</span>` +
+    `<button class="gap-all" data-gap="${si}" data-dir="all" aria-label="Expand all ${hidden} hidden ${plural}">` +
+      `<span class="gap-text">${hidden} hidden ${plural}</span>` +
+    `</button></div>`;
+}
+
+// expandGap peels more context into view. "down" reveals the top of the gap
+// (context flowing down from the hunk above); "up" reveals the bottom (flowing
+// up from the hunk below); "all" reveals the whole gap. State is keyed by
+// segment index and reapplied on every render, so expansions survive the
+// in-place re-renders triggered by comments and SSE updates.
 function expandGap(si, dir) {
   const seg = ((activeReview && activeReview.segments) || [])[si];
   if (!seg) return;
   const len = seg.rows.length;
-  const st = gapState[si] || { up: 0, down: 0 };
+  const st = gapState[si] || { top: 0, bottom: 0 };
   if (dir === 'all') {
-    st.up = len;
-    st.down = 0;
-  } else if (dir === 'up') {
-    st.up = Math.min(len - st.down, st.up + GAP_CHUNK);
+    st.top = len;
+    st.bottom = 0;
   } else if (dir === 'down') {
-    st.down = Math.min(len - st.up, st.down + GAP_CHUNK);
+    st.top = Math.min(len - st.bottom, st.top + GAP_CHUNK);
+  } else if (dir === 'up') {
+    st.bottom = Math.min(len - st.top, st.bottom + GAP_CHUNK);
   }
   gapState[si] = st;
   rerenderReviewBodyPreservingScroll();
