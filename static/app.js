@@ -9,8 +9,10 @@ let authStatus = {};
 let appStarted = false;
 let settingsDraft = {};
 let appVersion = '';
-let reviews = [];        // review metadata, newest first (no hunks)
-let activeReview = null; // full review (with hunks) shown in the review screen
+let reviews = [];        // review metadata, newest first (no diff)
+let activeReview = null; // full review (with diff segments) shown in the review screen
+let gapState = {};       // segment index -> {up, down}: context lines revealed from each end
+const GAP_CHUNK = 20;    // lines revealed per expand tap
 let composerCtx = null;  // line target for the open comment composer; null = global
 
 document.addEventListener('DOMContentLoaded', init);
@@ -1501,6 +1503,7 @@ async function openReviewScreen(id) {
     return;
   }
   activeReview = full;
+  gapState = {}; // expansions are per-open; don't carry across reviews
   closeComposer();
   renderReviewScreen();
   const screen = document.getElementById('review-screen');
@@ -1584,11 +1587,12 @@ function rowKey(row) {
   return row.t === 'del' ? `old:${row.o}` : `new:${row.n}`;
 }
 
-// rowTextByKey recovers a row's source text from the active review's hunks.
-// The text never rides on a DOM attribute — code routinely contains quotes.
+// rowTextByKey recovers a row's source text from the active review's diff
+// segments. The text never rides on a DOM attribute — code routinely contains
+// quotes.
 function rowTextByKey(rk) {
-  for (const h of (activeReview && activeReview.hunks) || []) {
-    for (const row of h.rows) {
+  for (const seg of (activeReview && activeReview.segments) || []) {
+    for (const row of seg.rows) {
       if (rowKey(row) === rk) return row.text;
     }
   }
@@ -1622,38 +1626,93 @@ function renderReviewBody() {
     parts.push(`<div class="global-comments">${globals.map(c => commentCard(c, pending)).join('')}</div>`);
   }
 
-  const hunks = r.hunks || [];
-  if (hunks.length === 0 && !r.tooLarge) {
+  const segments = r.segments || [];
+  if (segments.length === 0 && !r.tooLarge) {
     parts.push('<div class="review-empty">No content changes to show.</div>');
   }
 
   // diff-wrap gives no-wrap mode one shared width (max-content), so row
   // backgrounds stay uniform bands while the body scrolls horizontally.
-  if (hunks.length) parts.push('<div class="diff-wrap">');
-  hunks.forEach((h, hi) => {
-    if (hi > 0) parts.push('<div class="hunk-sep">···</div>');
-    parts.push('<div class="hunk">');
-    for (const row of h.rows) {
-      const k = rowKey(row);
-      const commented = byKey.has(k) ? 'commented' : '';
-      parts.push(
-        `<div class="drow t-${row.t} ${commented} ${pending ? 'tappable' : ''}" data-rk="${k}" data-line="${row.t === 'del' ? row.o : row.n}" data-side="${row.t === 'del' ? 'old' : 'new'}">` +
-          `<span class="ln">${row.o || ''}</span>` +
-          `<span class="ln">${row.n || ''}</span>` +
-          `<span class="dsign">${row.t === 'add' ? '+' : row.t === 'del' ? '−' : ''}</span>` +
-          `<code class="dcode">${highlightLine(row.text, lang)}</code>` +
-        `</div>`
-      );
-      if (byKey.has(k)) {
-        parts.push(`<div class="line-comments">${byKey.get(k).map(c => commentCard(c, pending)).join('')}</div>`);
-      }
+  if (segments.length) parts.push('<div class="diff-wrap">');
+  segments.forEach((seg, si) => {
+    if (seg.kind === 'gap') {
+      parts.push(renderGap(seg, si, byKey, pending, lang));
+      return;
     }
+    parts.push('<div class="hunk">');
+    for (const row of seg.rows) parts.push(renderRow(row, byKey, pending, lang));
     parts.push('</div>');
   });
-  if (hunks.length) parts.push('</div>');
+  if (segments.length) parts.push('</div>');
 
   body.innerHTML = parts.join('');
   applyWrapPref();
+}
+
+// renderRow builds one diff line (plus any attached comments). Shared by hunks
+// and the context revealed when a gap is expanded.
+function renderRow(row, byKey, pending, lang) {
+  const k = rowKey(row);
+  const commented = byKey.has(k) ? 'commented' : '';
+  let html =
+    `<div class="drow t-${row.t} ${commented} ${pending ? 'tappable' : ''}" data-rk="${k}" data-line="${row.t === 'del' ? row.o : row.n}" data-side="${row.t === 'del' ? 'old' : 'new'}">` +
+      `<span class="ln">${row.o || ''}</span>` +
+      `<span class="ln">${row.n || ''}</span>` +
+      `<span class="dsign">${row.t === 'add' ? '+' : row.t === 'del' ? '−' : ''}</span>` +
+      `<code class="dcode">${highlightLine(row.text, lang)}</code>` +
+    `</div>`;
+  if (byKey.has(k)) {
+    html += `<div class="line-comments">${byKey.get(k).map(c => commentCard(c, pending)).join('')}</div>`;
+  }
+  return html;
+}
+
+// renderGap renders a collapsed run of unchanged context: rows already revealed
+// from the top, an expand bar for whatever's still hidden, then rows revealed
+// from the bottom. Tapping ⌃/⌄ peels GAP_CHUNK lines off each end; the middle
+// count expands the whole gap. Revealed lines are ordinary context rows, so
+// they stay tappable for comments like any other line.
+function renderGap(seg, si, byKey, pending, lang) {
+  const rows = seg.rows;
+  const st = gapState[si] || { up: 0, down: 0 };
+  const up = Math.min(st.up, rows.length);
+  const down = Math.min(st.down, rows.length - up);
+  const hidden = rows.length - up - down;
+
+  const out = [];
+  for (let i = 0; i < up; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  if (hidden > 0) {
+    out.push(
+      `<div class="diff-gap" role="group" aria-label="${hidden} hidden lines">` +
+        `<button class="gap-chev" data-gap="${si}" data-dir="up" aria-label="Reveal lines below the change above">⌃</button>` +
+        `<button class="gap-count" data-gap="${si}" data-dir="all">↕ ${hidden} ${hidden === 1 ? 'line' : 'lines'}</button>` +
+        `<button class="gap-chev" data-gap="${si}" data-dir="down" aria-label="Reveal lines above the change below">⌄</button>` +
+      `</div>`
+    );
+  }
+  for (let i = rows.length - down; i < rows.length; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  return out.join('');
+}
+
+// expandGap peels more context into view. "up"/"down" reveal GAP_CHUNK lines
+// from the top/bottom of the collapsed run; "all" reveals the whole gap. State
+// is keyed by segment index and reapplied on every render, so expansions
+// survive the in-place re-renders triggered by comments and SSE updates.
+function expandGap(si, dir) {
+  const seg = ((activeReview && activeReview.segments) || [])[si];
+  if (!seg) return;
+  const len = seg.rows.length;
+  const st = gapState[si] || { up: 0, down: 0 };
+  if (dir === 'all') {
+    st.up = len;
+    st.down = 0;
+  } else if (dir === 'up') {
+    st.up = Math.min(len - st.down, st.up + GAP_CHUNK);
+  } else if (dir === 'down') {
+    st.down = Math.min(len - st.up, st.down + GAP_CHUNK);
+  }
+  gapState[si] = st;
+  rerenderReviewBodyPreservingScroll();
 }
 
 // --- word wrap preference (cookie-persisted) ---
@@ -1803,6 +1862,11 @@ function bindReviewEvents() {
           renderReviewFoot();
         })
         .catch(err => toast(err.message, true));
+      return;
+    }
+    const gapBtn = e.target.closest('.diff-gap button[data-gap]');
+    if (gapBtn) {
+      expandGap(parseInt(gapBtn.dataset.gap, 10), gapBtn.dataset.dir);
       return;
     }
     const row = e.target.closest('.drow.tappable');

@@ -1352,16 +1352,47 @@ main {
 
 .hunk { padding: 4px 0; }
 
-.hunk-sep {
-  text-align: center;
+/* Expandable gap bar between hunks (and above/below them): the ⌃/⌄ chevrons
+   peel context into view, the center count expands the whole gap. */
+.diff-gap {
+  display: flex;
+  align-items: stretch;
   color: var(--text-secondary);
-  opacity: 0.5;
-  font-size: 14px;
-  letter-spacing: 6px;
-  padding: 8px 0;
+  font-size: 12px;
+  background: var(--surface);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.diff-gap button {
+  appearance: none;
+  -webkit-appearance: none;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.diff-gap .gap-chev {
+  flex: 0 0 56px;
+  font-size: 16px;
+}
+
+.diff-gap .gap-count {
+  flex: 1 1 auto;
+  letter-spacing: 0.5px;
+}
+
+.diff-gap button:active {
+  background: rgba(124, 58, 237, 0.18);
+  color: var(--text);
 }
 
 .drow {
@@ -1628,7 +1659,7 @@ main {
 }
 
 .review-body.nowrap .line-comments,
-.review-body.nowrap .hunk-sep {
+.review-body.nowrap .diff-gap {
   position: sticky;
   left: 0;
   width: 100vw;

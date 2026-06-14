@@ -89,19 +89,24 @@ type DiffRow struct {
 	Text string `json:"text"`
 }
 
-type DiffHunk struct {
+// DiffSegment is one piece of the rendered review diff: a visible run of
+// changed rows (Kind "hunk") or a collapsed run of unchanged context the UI
+// presents as an expandable bar (Kind "gap"). Gap rows carry their text so the
+// client can reveal more of the file in place, without another round-trip.
+type DiffSegment struct {
+	Kind string    `json:"kind"` // "hunk" | "gap"
 	Rows []DiffRow `json:"rows"`
 }
 
 // reviewView is the API shape: review metadata without file contents, plus
-// hunks when requested.
+// the diff segments (hunks + collapsed gaps) when requested.
 type reviewView struct {
 	*Review
-	Base     omitted    `json:"base,omitempty"`
-	Proposed omitted    `json:"proposed,omitempty"`
-	Hunks    []DiffHunk `json:"hunks,omitempty"`
-	Adds     int        `json:"adds"`
-	Dels     int        `json:"dels"`
+	Base     omitted       `json:"base,omitempty"`
+	Proposed omitted       `json:"proposed,omitempty"`
+	Segments []DiffSegment `json:"segments,omitempty"`
+	Adds     int           `json:"adds"`
+	Dels     int           `json:"dels"`
 }
 
 // omitted shadows a field out of the embedded struct's JSON.
@@ -601,7 +606,7 @@ func (rm *ReviewManager) viewLocked(r *Review, withDiff bool) *reviewView {
 	v := &reviewView{Review: r}
 	v.Adds, v.Dels = diffStats(r.Base, r.Proposed)
 	if withDiff {
-		v.Hunks = diffHunks(r.Base, r.Proposed)
+		v.Segments = diffSegments(r.Base, r.Proposed)
 	}
 	return v
 }
@@ -696,11 +701,21 @@ func diffStats(base, proposed string) (adds, dels int) {
 	return adds, dels
 }
 
-const diffContext = 3
+const (
+	diffContext = 3
+	// gapMinCollapse is the shortest collapsed run worth hiding behind an
+	// expand bar. Shorter unchanged stretches are folded back into the
+	// surrounding hunk and shown inline — a one-line "expand" bar is just noise.
+	gapMinCollapse = 4
+)
 
-// diffHunks renders the full row stream (del/add/ctx with line numbers), then
-// keeps only rows within diffContext lines of a change, grouped into hunks.
-func diffHunks(base, proposed string) []DiffHunk {
+// diffSegments renders the full row stream (del/add/ctx with line numbers),
+// then splits it into ordered segments: visible "hunk" runs (every changed row
+// plus diffContext lines of surrounding context) and collapsed "gap" runs (the
+// unchanged remainder, which the UI shows as expandable bars). Gap rows still
+// carry their text, so expansion is purely client-side. Returns nil when there
+// is no change.
+func diffSegments(base, proposed string) []DiffSegment {
 	if base == proposed {
 		return nil
 	}
@@ -724,6 +739,8 @@ func diffHunks(base, proposed string) []DiffHunk {
 		}
 	}
 
+	// keep marks the rows shown by default: each changed row and the
+	// diffContext lines on either side of it.
 	keep := make([]bool, len(rows))
 	for i, r := range rows {
 		if r.T == "ctx" {
@@ -736,18 +753,41 @@ func diffHunks(base, proposed string) []DiffHunk {
 		}
 	}
 
-	var hunks []DiffHunk
-	var cur []DiffRow
-	for i, r := range rows {
+	// Fold short collapsed runs back into the visible diff — not worth a bar.
+	for i := 0; i < len(rows); {
 		if keep[i] {
-			cur = append(cur, r)
-		} else if len(cur) > 0 {
-			hunks = append(hunks, DiffHunk{Rows: cur})
-			cur = nil
+			i++
+			continue
 		}
+		j := i
+		for j < len(rows) && !keep[j] {
+			j++
+		}
+		if j-i <= gapMinCollapse {
+			for k := i; k < j; k++ {
+				keep[k] = true
+			}
+		}
+		i = j
 	}
-	if len(cur) > 0 {
-		hunks = append(hunks, DiffHunk{Rows: cur})
+
+	// Emit one segment per maximal run of equal keep-ness, preserving order.
+	// Each run is copied so a segment's Rows never aliases the next segment's
+	// backing array.
+	var segs []DiffSegment
+	for i := 0; i < len(rows); {
+		j := i
+		for j < len(rows) && keep[j] == keep[i] {
+			j++
+		}
+		run := make([]DiffRow, j-i)
+		copy(run, rows[i:j])
+		kind := "gap"
+		if keep[i] {
+			kind = "hunk"
+		}
+		segs = append(segs, DiffSegment{Kind: kind, Rows: run})
+		i = j
 	}
-	return hunks
+	return segs
 }
