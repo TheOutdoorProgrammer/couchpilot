@@ -565,3 +565,130 @@ func waitForWaiter(t *testing.T, rm *ReviewManager, id string) {
 	}
 	t.Fatal("no waiter registered in time")
 }
+
+func TestUpdateCommentRange(t *testing.T) {
+	rm := newTestReviewManager(t)
+	r := submitWrite(t, rm, "s1", "/tmp/a", "A")
+	c, err := rm.AddComment(r.ID, ReviewComment{Line: 8, Side: "new", LineText: "return foo", Text: "note"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	span := ReviewComment{
+		Line: 8, Side: "new", LineText: "return foo",
+		StartLine: 5, StartSide: "new", StartText: "foo := bar()",
+	}
+	got, err := rm.UpdateCommentRange(r.ID, c.ID, span)
+	if err != nil {
+		t.Fatalf("grow: %v", err)
+	}
+	if !got.isRange() || got.StartLine != 5 || got.Line != 8 {
+		t.Errorf("range not applied: %+v", got)
+	}
+	if got.Text != "note" {
+		t.Errorf("body must be preserved, got %q", got.Text)
+	}
+
+	// Zero start collapses it back to a single line.
+	got, err = rm.UpdateCommentRange(r.ID, c.ID, ReviewComment{Line: 8, Side: "new", LineText: "return foo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.isRange() {
+		t.Errorf("should collapse to single line: %+v", got)
+	}
+
+	if _, err := rm.UpdateCommentRange("nope", c.ID, span); err == nil {
+		t.Error("update on missing review should error")
+	}
+	if _, err := rm.UpdateCommentRange(r.ID, "missing", span); err == nil {
+		t.Error("update on missing comment should error")
+	}
+	if _, err := rm.UpdateCommentRange(r.ID, c.ID, ReviewComment{Line: 0}); err == nil {
+		t.Error("range without an anchor should error")
+	}
+	g, _ := rm.AddComment(r.ID, ReviewComment{Text: "overall"})
+	if _, err := rm.UpdateCommentRange(r.ID, g.ID, span); err == nil {
+		t.Error("range on an overall comment should error")
+	}
+
+	rm.Decide(r.ID, "approve")
+	if _, err := rm.UpdateCommentRange(r.ID, c.ID, span); err == nil {
+		t.Error("update on decided review should error")
+	}
+}
+
+func TestUpdateCommentRangePersists(t *testing.T) {
+	dir := t.TempDir()
+	rm, err := NewReviewManager(dir, NewSSEHub())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm.reviewOn = func(string) bool { return true }
+	r := submitWrite(t, rm, "s1", "/tmp/a", "A")
+	c, _ := rm.AddComment(r.ID, ReviewComment{Line: 8, Side: "new", LineText: "return foo", Text: "x"})
+	if _, err := rm.UpdateCommentRange(r.ID, c.ID, ReviewComment{
+		Line: 8, Side: "new", LineText: "return foo",
+		StartLine: 5, StartSide: "new", StartText: "foo := bar()",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rm2, err := NewReviewManager(dir, NewSSEHub())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm2.reviewOn = func(string) bool { return true }
+	got := rm2.Get(r.ID, false)
+	if got == nil || len(got.Comments) != 1 {
+		t.Fatalf("reload wrong: %+v", got)
+	}
+	if rc := got.Comments[0]; !rc.isRange() || rc.StartLine != 5 || rc.StartText != "foo := bar()" {
+		t.Errorf("range didn't persist: %+v", rc)
+	}
+}
+
+func TestUpdateCommentText(t *testing.T) {
+	rm := newTestReviewManager(t)
+	r := submitWrite(t, rm, "s1", "/tmp/a", "A")
+
+	// Editing text must leave a range comment's span intact.
+	c, _ := rm.AddComment(r.ID, ReviewComment{
+		Line: 8, Side: "new", LineText: "return foo",
+		StartLine: 5, StartSide: "new", StartText: "foo := bar()", Text: "old",
+	})
+	got, err := rm.UpdateCommentText(r.ID, c.ID, "new words")
+	if err != nil {
+		t.Fatalf("update text: %v", err)
+	}
+	if got.Text != "new words" {
+		t.Errorf("text = %q, want %q", got.Text, "new words")
+	}
+	if !got.isRange() || got.StartLine != 5 || got.Line != 8 {
+		t.Errorf("range must survive a text edit: %+v", got)
+	}
+
+	// Overall (global) comment text is editable too and stays global.
+	g, _ := rm.AddComment(r.ID, ReviewComment{Text: "overall old"})
+	gg, err := rm.UpdateCommentText(r.ID, g.ID, "overall new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gg.Text != "overall new" || gg.Line != 0 {
+		t.Errorf("global text edit wrong: %+v", gg)
+	}
+
+	if _, err := rm.UpdateCommentText(r.ID, c.ID, "  "); err == nil {
+		t.Error("blank text should be rejected")
+	}
+	if _, err := rm.UpdateCommentText("nope", c.ID, "x"); err == nil {
+		t.Error("missing review should error")
+	}
+	if _, err := rm.UpdateCommentText(r.ID, "missing", "x"); err == nil {
+		t.Error("missing comment should error")
+	}
+	rm.Decide(r.ID, "approve")
+	if _, err := rm.UpdateCommentText(r.ID, c.ID, "x"); err == nil {
+		t.Error("update on decided review should error")
+	}
+}

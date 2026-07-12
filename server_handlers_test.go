@@ -267,3 +267,74 @@ func TestReviewErrCode(t *testing.T) {
 		t.Error("other errors should map to 409")
 	}
 }
+
+func TestHandleUpdateCommentRange(t *testing.T) {
+	s := newFullServer(t)
+	r := seedReview(t, s, "s1")
+
+	w := doReq(t, s.handleAddReviewComment, "POST", "/api/reviews/"+r.ID+"/comments",
+		`{"line":8,"side":"new","lineText":"return foo","text":"note"}`,
+		map[string]string{"id": r.ID})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add = %d: %s", w.Code, w.Body.String())
+	}
+	var added ReviewComment
+	if err := json.Unmarshal(w.Body.Bytes(), &added); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"line":8,"side":"new","lineText":"return foo","startLine":5,"startSide":"new","startText":"foo := bar()"}`
+	w = doReq(t, s.handleUpdateReviewComment, "PATCH", "/api/reviews/"+r.ID+"/comments/"+added.ID, body,
+		map[string]string{"id": r.ID, "cid": added.ID})
+	if w.Code != 200 {
+		t.Fatalf("patch = %d: %s", w.Code, w.Body.String())
+	}
+	var updated ReviewComment
+	if err := json.Unmarshal(w.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if !updated.isRange() || updated.StartLine != 5 || updated.Text != "note" {
+		t.Errorf("range not applied: %+v", updated)
+	}
+
+	w = doReq(t, s.handleUpdateReviewComment, "PATCH", "/api/reviews/"+r.ID+"/comments/nope", body,
+		map[string]string{"id": r.ID, "cid": "nope"})
+	if w.Code != http.StatusNotFound {
+		t.Errorf("patch missing comment = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleSetReviewCommentText(t *testing.T) {
+	s := newFullServer(t)
+	r := seedReview(t, s, "s1")
+
+	w := doReq(t, s.handleAddReviewComment, "POST", "/api/reviews/"+r.ID+"/comments",
+		`{"line":8,"side":"new","lineText":"return foo","text":"old"}`,
+		map[string]string{"id": r.ID})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add = %d: %s", w.Code, w.Body.String())
+	}
+	var added ReviewComment
+	if err := json.Unmarshal(w.Body.Bytes(), &added); err != nil {
+		t.Fatal(err)
+	}
+
+	w = doReq(t, s.handleSetReviewCommentText, "PUT", "/api/reviews/"+r.ID+"/comments/"+added.ID,
+		`{"text":"new words"}`, map[string]string{"id": r.ID, "cid": added.ID})
+	if w.Code != 200 {
+		t.Fatalf("put = %d: %s", w.Code, w.Body.String())
+	}
+	var updated ReviewComment
+	if err := json.Unmarshal(w.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Text != "new words" || updated.Line != 8 {
+		t.Errorf("text edit wrong: %+v", updated)
+	}
+
+	w = doReq(t, s.handleSetReviewCommentText, "PUT", "/api/reviews/"+r.ID+"/comments/nope",
+		`{"text":"x"}`, map[string]string{"id": r.ID, "cid": "nope"})
+	if w.Code != http.StatusNotFound {
+		t.Errorf("put missing comment = %d, want 404", w.Code)
+	}
+}

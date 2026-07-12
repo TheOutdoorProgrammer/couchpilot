@@ -192,3 +192,42 @@ func TestDiffSegmentsReconstruct(t *testing.T) {
 		t.Errorf("expected 25 old and 25 new lines, got %d/%d", wantO-1, wantN-1)
 	}
 }
+
+// TestRangeCommentFormatting: a range quotes only its first line and cites the
+// span (which tells claude the last line); single-line comments are unchanged.
+func TestRangeCommentFormatting(t *testing.T) {
+	r := &Review{FilePath: "/tmp/f.go", Status: ReviewDenied, Comments: []ReviewComment{
+		{Line: 3, Side: "new", LineText: "single line", Text: "single note"},
+		{StartLine: 5, StartSide: "new", StartText: "foo := bar()", Line: 8, Side: "new", LineText: "return foo", Text: "range note"},
+	}}
+	var b strings.Builder
+	writeComments(&b, r)
+	out := b.String()
+	for _, want := range []string{
+		"Line 3 (new): `single line`",
+		"single note",
+		"Lines 5-8 (new)",
+		"first line `foo := bar()`",
+		"range note",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("formatting missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "`return foo`") {
+		t.Errorf("range must not quote the last line:\n%s", out)
+	}
+}
+
+// TestRangeCommentCrossSide: a span from a deleted row to an added row spells out
+// each endpoint's side.
+func TestRangeCommentCrossSide(t *testing.T) {
+	r := &Review{Status: ReviewDenied, Comments: []ReviewComment{
+		{StartLine: 5, StartSide: "old", StartText: "gone", Line: 7, Side: "new", LineText: "added", Text: "crosses"},
+	}}
+	var b strings.Builder
+	writeComments(&b, r)
+	if out := b.String(); !strings.Contains(out, "Lines 5 (old/removed) to 7 (new)") {
+		t.Errorf("cross-side label wrong:\n%s", out)
+	}
+}

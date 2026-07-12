@@ -43,13 +43,27 @@ const reviewRetention = 30
 // keep the review (it can still be approved/denied) but skip diff rendering.
 const reviewMaxBytes = 2 << 20
 
+// ReviewComment anchors to a single diff row (Line/Side) or, for a range
+// comment, spans StartLine..Line. Line is the END of the span — the card
+// renders under it, GitHub-style — and Line 0 is a global/overall comment. The
+// frontend orients the endpoints because render order isn't line-number order
+// once adds and dels interleave. Comments persisted before ranges existed have
+// no Start* fields, so StartLine == 0 reads back as a plain single-line comment.
 type ReviewComment struct {
 	ID        string    `json:"id"`
-	Line      int       `json:"line,omitempty"` // 0 = global comment
-	Side      string    `json:"side,omitempty"` // "new" or "old"; "" for global
-	LineText  string    `json:"lineText,omitempty"`
+	Line      int       `json:"line,omitempty"`      // end of span; 0 = global
+	Side      string    `json:"side,omitempty"`      // "new"/"old"; "" for global
+	LineText  string    `json:"lineText,omitempty"`  // text of the end line
+	StartLine int       `json:"startLine,omitempty"` // start of span; 0 or == Line ⇒ single line
+	StartSide string    `json:"startSide,omitempty"` // side of the start line
+	StartText string    `json:"startText,omitempty"` // text of the start line (quoted back to claude)
 	Text      string    `json:"text"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// isRange reports whether the comment covers more than one row.
+func (c ReviewComment) isRange() bool {
+	return c.StartLine != 0 && (c.StartLine != c.Line || c.StartSide != c.Side)
 }
 
 type Review struct {
@@ -463,6 +477,70 @@ func (rm *ReviewManager) DeleteComment(id, commentID string) error {
 	return os.ErrNotExist
 }
 
+// UpdateCommentRange re-spans a pending comment as the reviewer grows or shrinks
+// the selection. The frontend sends already-oriented endpoints (start = earlier
+// in render order); a zero StartLine collapses it back to a single line. Only
+// the anchored rows change — the comment body is left untouched.
+func (rm *ReviewManager) UpdateCommentRange(id, commentID string, span ReviewComment) (*ReviewComment, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	r, ok := rm.byID[id]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if r.Status != ReviewPending {
+		return nil, fmt.Errorf("review already %s", r.Status)
+	}
+	if span.Line == 0 {
+		return nil, fmt.Errorf("a range needs a line anchor")
+	}
+	for i := range r.Comments {
+		c := &r.Comments[i]
+		if c.ID != commentID {
+			continue
+		}
+		if c.Line == 0 {
+			return nil, fmt.Errorf("cannot set a range on an overall comment")
+		}
+		c.Line, c.Side, c.LineText = span.Line, span.Side, span.LineText
+		c.StartLine, c.StartSide, c.StartText = span.StartLine, span.StartSide, span.StartText
+		rm.persistLocked(r.SessionID)
+		rm.broadcastLocked(r)
+		updated := *c
+		return &updated, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// UpdateCommentText replaces a pending comment's body text, leaving its anchor
+// or range untouched. Works for line, range and overall comments alike.
+func (rm *ReviewManager) UpdateCommentText(id, commentID, text string) (*ReviewComment, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	r, ok := rm.byID[id]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if r.Status != ReviewPending {
+		return nil, fmt.Errorf("review already %s", r.Status)
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("comment text is empty")
+	}
+	for i := range r.Comments {
+		c := &r.Comments[i]
+		if c.ID != commentID {
+			continue
+		}
+		c.Text = text
+		rm.persistLocked(r.SessionID)
+		rm.broadcastLocked(r)
+		updated := *c
+		return &updated, nil
+	}
+	return nil, os.ErrNotExist
+}
+
 // Decide resolves a pending review. Denials require at least one comment —
 // otherwise claude has nothing to iterate on. Approvals with comments stash
 // the feedback for the PostToolUse hook to deliver after the write lands.
@@ -646,18 +724,45 @@ func writeComments(b *strings.Builder, r *Review) {
 		}
 	}
 	for _, c := range r.Comments {
-		if c.Line == 0 {
+		switch {
+		case c.Line == 0:
 			continue
+		case c.isRange():
+			writeRangeComment(b, c)
+		default:
+			writeLineComment(b, c)
 		}
-		side := "new"
-		if c.Side == "old" {
-			side = "old/removed"
-		}
-		if c.LineText != "" {
-			fmt.Fprintf(b, "\nLine %d (%s): `%s`\n  -> %s\n", c.Line, side, strings.TrimSpace(c.LineText), c.Text)
-		} else {
-			fmt.Fprintf(b, "\nLine %d (%s):\n  -> %s\n", c.Line, side, c.Text)
-		}
+	}
+}
+
+func sideLabel(side string) string {
+	if side == "old" {
+		return "old/removed"
+	}
+	return "new"
+}
+
+func writeLineComment(b *strings.Builder, c ReviewComment) {
+	side := sideLabel(c.Side)
+	if c.LineText != "" {
+		fmt.Fprintf(b, "\nLine %d (%s): `%s`\n  -> %s\n", c.Line, side, strings.TrimSpace(c.LineText), c.Text)
+	} else {
+		fmt.Fprintf(b, "\nLine %d (%s):\n  -> %s\n", c.Line, side, c.Text)
+	}
+}
+
+// writeRangeComment cites the span (start-end tells claude the last line) and
+// quotes only the first line — enough to locate the block without echoing all of
+// it. Sides are only spelled out per-endpoint when the span crosses add/del.
+func writeRangeComment(b *strings.Builder, c ReviewComment) {
+	loc := fmt.Sprintf("Lines %d-%d (%s)", c.StartLine, c.Line, sideLabel(c.StartSide))
+	if c.Side != c.StartSide {
+		loc = fmt.Sprintf("Lines %d (%s) to %d (%s)", c.StartLine, sideLabel(c.StartSide), c.Line, sideLabel(c.Side))
+	}
+	if c.StartText != "" {
+		fmt.Fprintf(b, "\n%s: first line `%s`\n  -> %s\n", loc, strings.TrimSpace(c.StartText), c.Text)
+	} else {
+		fmt.Fprintf(b, "\n%s:\n  -> %s\n", loc, c.Text)
 	}
 }
 

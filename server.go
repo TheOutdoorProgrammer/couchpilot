@@ -181,6 +181,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/reviews", s.handleListReviews)
 	mux.HandleFunc("GET /api/reviews/{id}", s.handleGetReview)
 	mux.HandleFunc("POST /api/reviews/{id}/comments", s.handleAddReviewComment)
+	mux.HandleFunc("PATCH /api/reviews/{id}/comments/{cid}", s.handleUpdateReviewComment)
+	mux.HandleFunc("PUT /api/reviews/{id}/comments/{cid}", s.handleSetReviewCommentText)
 	mux.HandleFunc("DELETE /api/reviews/{id}/comments/{cid}", s.handleDeleteReviewComment)
 	mux.HandleFunc("POST /api/reviews/{id}/decision", s.handleReviewDecision)
 	mux.HandleFunc("PUT /api/sessions/{id}/model", s.handleChangeModel)
@@ -771,6 +773,36 @@ func (s *Server) handleAddReviewComment(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, added)
+}
+
+func (s *Server) handleUpdateReviewComment(w http.ResponseWriter, r *http.Request) {
+	var span ReviewComment
+	if err := json.NewDecoder(r.Body).Decode(&span); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	updated, err := s.rm.UpdateCommentRange(r.PathValue("id"), r.PathValue("cid"), span)
+	if err != nil {
+		httpError(w, err.Error(), reviewErrCode(err))
+		return
+	}
+	writeJSON(w, updated)
+}
+
+func (s *Server) handleSetReviewCommentText(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	updated, err := s.rm.UpdateCommentText(r.PathValue("id"), r.PathValue("cid"), body.Text)
+	if err != nil {
+		httpError(w, err.Error(), reviewErrCode(err))
+		return
+	}
+	writeJSON(w, updated)
 }
 
 func (s *Server) handleDeleteReviewComment(w http.ResponseWriter, r *http.Request) {

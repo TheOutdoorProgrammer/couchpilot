@@ -13,7 +13,8 @@ let reviews = [];        // review metadata, newest first (no diff)
 let activeReview = null; // full review (with diff segments) shown in the review screen
 let gapState = {};       // segment index -> {up, down}: context lines revealed from each end
 const GAP_CHUNK = 20;    // lines revealed per expand tap
-let composerCtx = null;  // line target for the open comment composer; null = global
+let composerCtx = null;  // line/range target for the open comment composer; null = global
+let selection = null;    // in-flight line-range selection: {startKey, endKey, commentId}
 
 document.addEventListener('DOMContentLoaded', init);
 
@@ -1504,6 +1505,7 @@ async function openReviewScreen(id) {
   }
   activeReview = full;
   gapState = {}; // expansions are per-open; don't carry across reviews
+  selection = null; // never carry a line selection across reviews
   closeComposer();
   renderReviewScreen();
   const screen = document.getElementById('review-screen');
@@ -1515,6 +1517,7 @@ async function openReviewScreen(id) {
 function closeReviewScreen() {
   document.getElementById('review-screen').hidden = true;
   activeReview = null;
+  selection = null;
   closeComposer();
   if (!document.querySelector('.modal.active')) {
     document.body.classList.remove('modal-open');
@@ -1587,16 +1590,198 @@ function rowKey(row) {
   return row.t === 'del' ? `old:${row.o}` : `new:${row.n}`;
 }
 
-// rowTextByKey recovers a row's source text from the active review's diff
-// segments. The text never rides on a DOM attribute — code routinely contains
-// quotes.
-function rowTextByKey(rk) {
+// --- line-range selection (select-then-say) ---
+//
+// A comment can span a contiguous run of rows. The reviewer builds that span by
+// tapping: the first tap on a fresh row starts a one-row selection, a tap on the
+// row just past either end grows it, and a tap on an endpoint shrinks it back.
+// The span only becomes a comment on "Comment" (new) or is re-saved on "Save"
+// (editing an existing comment's range). Adjacency and membership are defined
+// over render order, not line numbers — line numbers aren't monotonic once adds
+// and dels interleave.
+
+function orderedRows() {
+  const out = [];
   for (const seg of (activeReview && activeReview.segments) || []) {
-    for (const row of seg.rows) {
-      if (rowKey(row) === rk) return row.text;
-    }
+    for (const row of seg.rows) out.push(row);
   }
-  return '';
+  return out;
+}
+
+function rowIndex() {
+  const m = new Map();
+  orderedRows().forEach((row, i) => m.set(rowKey(row), i));
+  return m;
+}
+
+function rowLineNo(row) { return row.t === 'del' ? row.o : row.n; }
+function rowSideOf(row) { return row.t === 'del' ? 'old' : 'new'; }
+
+// spanKeys returns the ordered row keys covered by [startKey..endKey], or [] if
+// either endpoint isn't a currently-rendered row.
+function spanKeys(startKey, endKey) {
+  const rows = orderedRows();
+  const idx = rowIndex();
+  let a = idx.get(startKey), b = idx.get(endKey);
+  if (a == null || b == null) return [];
+  if (a > b) [a, b] = [b, a];
+  const keys = [];
+  for (let i = a; i <= b; i++) keys.push(rowKey(rows[i]));
+  return keys;
+}
+
+// commentSpanStartKey derives a comment's start row key. The anchor line/side is
+// the END; single-line comments have no start fields, so start == end.
+function commentSpanStartKey(c) {
+  if (!c.line) return null;
+  return c.startLine ? `${c.startSide || 'new'}:${c.startLine}` : commentKey(c);
+}
+
+function commentAtKey(k) {
+  for (const c of (activeReview && activeReview.comments) || []) {
+    if (!c.line) continue;
+    if (spanKeys(commentSpanStartKey(c), commentKey(c)).includes(k)) return c;
+  }
+  return null;
+}
+
+function handleRowTap(k) {
+  if (!activeReview || activeReview.status !== 'pending') return;
+  if (!selection) {
+    const existing = commentAtKey(k);
+    if (existing) {
+      selection = { startKey: commentSpanStartKey(existing), endKey: commentKey(existing), commentId: existing.id };
+    } else {
+      selection = { startKey: k, endKey: k, commentId: null };
+    }
+  } else {
+    adjustSelection(k);
+  }
+  updateSelectionBar();
+  rerenderReviewBodyPreservingScroll();
+}
+
+// adjustSelection grows the selection when k is the row just past an end, shrinks
+// it when k is an endpoint of a multi-row span, ignores interior taps, and — for
+// a not-yet-saved selection — restarts at a fresh row when k is elsewhere.
+function adjustSelection(k) {
+  const rows = orderedRows();
+  const idx = rowIndex();
+  const ki = idx.get(k);
+  let a = idx.get(selection.startKey), b = idx.get(selection.endKey);
+  if (ki == null || a == null || b == null) return;
+  if (a > b) [a, b] = [b, a];
+  if (ki === a - 1) { selection.startKey = k; return; }                      // grow up
+  if (ki === b + 1) { selection.endKey = k; return; }                        // grow down
+  if (b > a && ki === a) { selection.startKey = rowKey(rows[a + 1]); return; } // shrink from top
+  if (b > a && ki === b) { selection.endKey = rowKey(rows[b - 1]); return; }   // shrink from bottom
+  if (ki > a && ki < b) return;                                              // interior: no-op
+  if (selection.commentId == null) selection = { startKey: k, endKey: k, commentId: null };
+}
+
+// selectionRange resolves the selection into oriented endpoints carrying the line
+// number, side and source text each end needs for the API and the label.
+function selectionRange() {
+  if (!selection) return null;
+  const rows = orderedRows();
+  const idx = rowIndex();
+  let a = idx.get(selection.startKey), b = idx.get(selection.endKey);
+  if (a == null || b == null) return null;
+  if (a > b) [a, b] = [b, a];
+  const start = rows[a], end = rows[b];
+  return {
+    single: a === b,
+    startLine: rowLineNo(start), startSide: rowSideOf(start), startText: start.text,
+    line: rowLineNo(end), side: rowSideOf(end), lineText: end.text,
+  };
+}
+
+function rangeLabel(rng) {
+  if (!rng) return '';
+  if (rng.single) return `Line ${rng.line}`;
+  if (rng.startSide === rng.side) return `Lines ${rng.startLine}–${rng.line}`;
+  const s = sd => (sd === 'old' ? '−' : '+');
+  return `Lines ${rng.startLine}${s(rng.startSide)}–${rng.line}${s(rng.side)}`;
+}
+
+// rangeBody is the API payload for a span; single-line selections omit the start
+// fields so they persist exactly like a legacy single-line comment.
+function rangeBody(rng) {
+  const body = { line: rng.line, side: rng.side, lineText: rng.lineText };
+  if (!rng.single) {
+    body.startLine = rng.startLine;
+    body.startSide = rng.startSide;
+    body.startText = rng.startText;
+  }
+  return body;
+}
+
+function updateSelectionBar() {
+  const bar = document.getElementById('selection-bar');
+  if (!bar) return;
+  if (!selection) { bar.hidden = true; return; }
+  bar.hidden = false;
+  document.getElementById('selection-label').textContent =
+    (selection.commentId ? 'Range · ' : '') + rangeLabel(selectionRange());
+  document.getElementById('selection-commit').textContent = selection.commentId ? 'Save' : 'Comment';
+}
+
+function clearSelection() {
+  selection = null;
+  updateSelectionBar();
+}
+
+function cancelSelection() {
+  clearSelection();
+  rerenderReviewBodyPreservingScroll();
+}
+
+// commitSelection turns the span into a comment: a new selection opens the
+// composer for text; editing an existing comment's range PATCHes the span.
+async function commitSelection() {
+  const rng = selectionRange();
+  if (!rng || !activeReview) return;
+  if (!selection.commentId) {
+    openComposer(rng);
+    return;
+  }
+  try {
+    const updated = await api('/reviews/' + activeReview.id + '/comments/' + selection.commentId, {
+      method: 'PATCH', body: JSON.stringify(rangeBody(rng)),
+    });
+    activeReview.comments = (activeReview.comments || []).map(c => (c.id === updated.id ? updated : c));
+    clearSelection();
+    rerenderReviewBodyPreservingScroll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+// buildSpanInfo maps each row key to its role in a saved comment's span: present
+// ⇒ in-range, with start/end flags on the boundary rows. buildSelInfo does the
+// same for the in-flight selection.
+function buildSpanInfo(r) {
+  const info = new Map();
+  for (const c of r.comments || []) {
+    if (!c.line) continue;
+    tagSpan(info, spanKeys(commentSpanStartKey(c), commentKey(c)));
+  }
+  return info;
+}
+
+function buildSelInfo() {
+  const info = new Map();
+  if (selection) tagSpan(info, spanKeys(selection.startKey, selection.endKey));
+  return info;
+}
+
+function tagSpan(info, keys) {
+  keys.forEach((k, i) => {
+    const e = info.get(k) || {};
+    if (i === 0) e.start = true;
+    if (i === keys.length - 1) e.end = true;
+    info.set(k, e);
+  });
 }
 
 function renderReviewBody() {
@@ -1611,6 +1796,7 @@ function renderReviewBody() {
     if (!byKey.has(k)) byKey.set(k, []);
     byKey.get(k).push(c);
   }
+  const hl = { byKey, span: buildSpanInfo(r), sel: buildSelInfo() };
 
   const parts = [];
 
@@ -1638,11 +1824,11 @@ function renderReviewBody() {
     if (seg.kind === 'gap') {
       // A gap's position decides which way it can expand: the first segment is
       // the top of the file, the last is the bottom, anything else is interior.
-      parts.push(renderGap(seg, si, byKey, pending, lang, si === 0, si === segments.length - 1));
+      parts.push(renderGap(seg, si, hl, pending, lang, si === 0, si === segments.length - 1));
       return;
     }
     parts.push('<div class="hunk">');
-    for (const row of seg.rows) parts.push(renderRow(row, byKey, pending, lang));
+    for (const row of seg.rows) parts.push(renderRow(row, hl, pending, lang));
     parts.push('</div>');
   });
   if (segments.length) parts.push('</div>');
@@ -1653,18 +1839,24 @@ function renderReviewBody() {
 
 // renderRow builds one diff line (plus any attached comments). Shared by hunks
 // and the context revealed when a gap is expanded.
-function renderRow(row, byKey, pending, lang) {
+function renderRow(row, hl, pending, lang) {
   const k = rowKey(row);
-  const commented = byKey.has(k) ? 'commented' : '';
+  const cls = ['drow', `t-${row.t}`];
+  if (hl.byKey.has(k)) cls.push('commented');
+  const span = hl.span.get(k);
+  if (span) { cls.push('in-range'); if (span.start) cls.push('range-start'); if (span.end) cls.push('range-end'); }
+  const sel = hl.sel.get(k);
+  if (sel) { cls.push('selecting'); if (sel.start) cls.push('sel-start'); if (sel.end) cls.push('sel-end'); }
+  if (pending) cls.push('tappable');
   let html =
-    `<div class="drow t-${row.t} ${commented} ${pending ? 'tappable' : ''}" data-rk="${k}" data-line="${row.t === 'del' ? row.o : row.n}" data-side="${row.t === 'del' ? 'old' : 'new'}">` +
+    `<div class="${cls.join(' ')}" data-rk="${k}" data-line="${row.t === 'del' ? row.o : row.n}" data-side="${row.t === 'del' ? 'old' : 'new'}">` +
       `<span class="ln">${row.o || ''}</span>` +
       `<span class="ln">${row.n || ''}</span>` +
       `<span class="dsign">${row.t === 'add' ? '+' : row.t === 'del' ? '−' : ''}</span>` +
       `<code class="dcode">${highlightLine(row.text, lang)}</code>` +
     `</div>`;
-  if (byKey.has(k)) {
-    html += `<div class="line-comments">${byKey.get(k).map(c => commentCard(c, pending)).join('')}</div>`;
+  if (hl.byKey.has(k)) {
+    html += `<div class="line-comments">${hl.byKey.get(k).map(c => commentCard(c, pending)).join('')}</div>`;
   }
   return html;
 }
@@ -1673,7 +1865,7 @@ function renderRow(row, byKey, pending, lang) {
 // revealed from the top, a GitHub-style expander for whatever is still hidden,
 // then any rows revealed from the bottom. Revealed lines are ordinary context
 // rows, so they stay tappable for comments like any other line.
-function renderGap(seg, si, byKey, pending, lang, isTop, isBottom) {
+function renderGap(seg, si, hl, pending, lang, isTop, isBottom) {
   const rows = seg.rows;
   const st = gapState[si] || { top: 0, bottom: 0 };
   const top = Math.min(st.top, rows.length);
@@ -1681,9 +1873,9 @@ function renderGap(seg, si, byKey, pending, lang, isTop, isBottom) {
   const hidden = rows.length - top - bottom;
 
   const out = [];
-  for (let i = 0; i < top; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  for (let i = 0; i < top; i++) out.push(renderRow(rows[i], hl, pending, lang));
   if (hidden > 0) out.push(gapBar(si, hidden, isTop, isBottom));
-  for (let i = rows.length - bottom; i < rows.length; i++) out.push(renderRow(rows[i], byKey, pending, lang));
+  for (let i = rows.length - bottom; i < rows.length; i++) out.push(renderRow(rows[i], hl, pending, lang));
   return out.join('');
 }
 
@@ -1754,9 +1946,15 @@ function applyWrapPref() {
 }
 
 function commentCard(c, pending) {
+  const edit = pending ? `<button class="comment-edit" data-edit-comment="${c.id}" aria-label="Edit comment">✎</button>` : '';
   const del = pending ? `<button class="comment-del" data-del-comment="${c.id}" aria-label="Delete comment">&times;</button>` : '';
-  const label = c.line ? '' : '<span class="comment-scope">overall</span>';
-  return `<div class="comment-card">${label}<p>${esc(c.text)}</p>${del}</div>`;
+  let label = '';
+  if (!c.line) {
+    label = '<span class="comment-scope">overall</span>';
+  } else if (c.startLine && (c.startLine !== c.line || c.startSide !== c.side)) {
+    label = `<span class="comment-scope">lines ${c.startLine}–${c.line}</span>`;
+  }
+  return `<div class="comment-card">${label}<p>${esc(c.text)}</p>${edit}${del}</div>`;
 }
 
 function renderReviewFoot() {
@@ -1792,18 +1990,37 @@ function renderReviewFoot() {
 
 function openComposer(ctx) {
   composerCtx = ctx;
+  const editing = !!(ctx && ctx.commentId);
   const target = document.getElementById('composer-target');
-  if (ctx) {
-    target.innerHTML = `Line ${ctx.line} <code>${esc(ctx.lineText.trim().slice(0, 80))}</code>`;
+  if (ctx && ctx.global) {
+    target.textContent = editing ? 'Edit overall comment' : 'Overall comment';
+  } else if (ctx) {
+    const preview = ((ctx.single === false ? ctx.startText : ctx.lineText) || '').trim().slice(0, 80);
+    target.innerHTML = `${editing ? 'Edit ' : ''}${rangeLabel(ctx)} <code>${esc(preview)}</code>`;
   } else {
     target.textContent = 'Overall comment';
   }
   document.getElementById('composer-overlay').hidden = false;
   const composer = document.getElementById('composer');
   composer.hidden = false;
+  document.getElementById('composer-save').textContent = editing ? 'Save' : 'Comment';
   const text = document.getElementById('composer-text');
-  text.value = '';
+  text.value = editing ? ctx.text : '';
   setTimeout(() => text.focus(), 50);
+}
+
+// openComposerForEdit loads an existing comment's text into the composer. The
+// anchor/range fields ride along only to render the header; saving PUTs the new
+// text and leaves the anchor untouched.
+function openComposerForEdit(c) {
+  openComposer({
+    commentId: c.id,
+    text: c.text,
+    global: !c.line,
+    single: !(c.startLine && (c.startLine !== c.line || c.startSide !== c.side)),
+    line: c.line, side: c.side, lineText: c.lineText,
+    startLine: c.startLine, startSide: c.startSide, startText: c.startText,
+  });
 }
 
 function closeComposer() {
@@ -1815,13 +2032,20 @@ function closeComposer() {
 async function saveComposerComment() {
   const text = document.getElementById('composer-text').value.trim();
   if (!text || !activeReview) return;
-  const body = composerCtx
-    ? { line: composerCtx.line, side: composerCtx.side, lineText: composerCtx.lineText, text }
-    : { text };
   try {
-    const c = await api('/reviews/' + activeReview.id + '/comments', { method: 'POST', body: JSON.stringify(body) });
-    activeReview.comments = [...(activeReview.comments || []), c];
+    if (composerCtx && composerCtx.commentId) {
+      // Editing an existing comment's text — PUT leaves its anchor/range alone.
+      const updated = await api('/reviews/' + activeReview.id + '/comments/' + composerCtx.commentId, {
+        method: 'PUT', body: JSON.stringify({ text }),
+      });
+      activeReview.comments = (activeReview.comments || []).map(c => (c.id === updated.id ? updated : c));
+    } else {
+      const body = composerCtx ? { ...rangeBody(composerCtx), text } : { text };
+      const c = await api('/reviews/' + activeReview.id + '/comments', { method: 'POST', body: JSON.stringify(body) });
+      activeReview.comments = [...(activeReview.comments || []), c];
+    }
     closeComposer();
+    clearSelection();
     rerenderReviewBodyPreservingScroll();
     renderReviewFoot();
   } catch (err) {
@@ -1866,11 +2090,19 @@ function bindReviewEvents() {
   document.getElementById('composer-cancel').addEventListener('click', closeComposer);
   document.getElementById('composer-overlay').addEventListener('click', closeComposer);
   document.getElementById('composer-save').addEventListener('click', saveComposerComment);
+  document.getElementById('selection-commit').addEventListener('click', commitSelection);
+  document.getElementById('selection-cancel').addEventListener('click', cancelSelection);
 
   document.getElementById('review-prev').addEventListener('click', () => stepReview(-1));
   document.getElementById('review-next').addEventListener('click', () => stepReview(1));
 
   document.getElementById('review-body').addEventListener('click', (e) => {
+    const editBtn = e.target.closest('[data-edit-comment]');
+    if (editBtn && activeReview) {
+      const c = (activeReview.comments || []).find(x => x.id === editBtn.dataset.editComment);
+      if (c) openComposerForEdit(c);
+      return;
+    }
     const del = e.target.closest('[data-del-comment]');
     if (del && activeReview) {
       api('/reviews/' + activeReview.id + '/comments/' + del.dataset.delComment, { method: 'DELETE' })
@@ -1889,11 +2121,7 @@ function bindReviewEvents() {
     }
     const row = e.target.closest('.drow.tappable');
     if (row) {
-      openComposer({
-        line: parseInt(row.dataset.line, 10),
-        side: row.dataset.side,
-        lineText: rowTextByKey(row.dataset.rk),
-      });
+      handleRowTap(row.dataset.rk);
     }
   });
 

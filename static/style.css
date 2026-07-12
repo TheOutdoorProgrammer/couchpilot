@@ -1452,6 +1452,37 @@ main {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* Range comments. A saved comment's span gets the accent band; the in-flight
+   selection gets a brighter blue so "what I'm picking now" reads apart from
+   "already commented". Caps round the first/last row of a span into one block.
+   .selecting rules follow .in-range so editing a saved range shows blue. */
+.drow.in-range { background: rgba(124, 58, 237, 0.13); box-shadow: inset 3px 0 0 var(--accent); }
+.drow.range-start { border-top-left-radius: var(--radius-sm); border-top-right-radius: var(--radius-sm); }
+.drow.range-end { border-bottom-left-radius: var(--radius-sm); border-bottom-right-radius: var(--radius-sm); }
+
+.drow.selecting { background: rgba(88, 166, 255, 0.22); box-shadow: inset 3px 0 0 var(--blue); }
+.drow.sel-start { border-top-left-radius: var(--radius-sm); border-top-right-radius: var(--radius-sm); }
+.drow.sel-end { border-bottom-left-radius: var(--radius-sm); border-bottom-right-radius: var(--radius-sm); }
+
+/* Selection bar: sits above the Deny/Approve foot while a span is being built or
+   an existing comment's range is edited. */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.selection-bar[hidden] { display: none; }
+.selection-label {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--blue);
+}
+.selection-actions { display: flex; gap: 8px; }
+
 .line-comments, .global-comments {
   padding: 4px 12px 6px 12px;
 }
@@ -1464,7 +1495,7 @@ main {
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   border-radius: var(--radius-sm);
-  padding: 10px 34px 10px 12px;
+  padding: 10px 58px 10px 12px;
   margin-bottom: 6px;
   font-size: 14px;
   line-height: 1.45;
@@ -1490,6 +1521,19 @@ main {
   border: none;
   color: var(--red);
   font-size: 18px;
+  padding: 2px 6px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.comment-edit {
+  position: absolute;
+  top: 6px;
+  right: 32px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 14px;
   padding: 2px 6px;
   cursor: pointer;
   opacity: 0.7;
