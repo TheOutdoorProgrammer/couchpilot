@@ -609,7 +609,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// No "Connection" header: it's hop-by-hop and forbidden over HTTP/2 (Traefik
+	// serves HTTP/2 to the browser), where a leaked value trips ERR_HTTP2_PROTOCOL_ERROR.
+	// Go's HTTP/1.1 server keeps the connection alive on its own anyway.
 
 	ch := s.hub.Register()
 	defer s.hub.Unregister(ch)
@@ -617,6 +619,13 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	data, _ := json.Marshal(s.sm.GetSessions())
 	fmt.Fprintf(w, "event: init\ndata: %s\n\n", data)
 	flusher.Flush()
+
+	// Heartbeat: an idle SSE stream carries no traffic, so Traefik/proxy idle
+	// timeouts reset it — the browser reports that as ERR_HTTP2_PROTOCOL_ERROR
+	// and the UI silently stops getting live updates. A periodic SSE comment
+	// (ignored by EventSource) keeps the stream active.
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -626,6 +635,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			}
 			data, _ := json.Marshal(event.Data)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
