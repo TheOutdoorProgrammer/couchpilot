@@ -1460,6 +1460,9 @@ main {
 .drow.range-start { border-top-left-radius: var(--radius-sm); border-top-right-radius: var(--radius-sm); }
 .drow.range-end { border-bottom-left-radius: var(--radius-sm); border-bottom-right-radius: var(--radius-sm); }
 
+/* While a mouse drag is building a line range, the diff is a click/drag surface:
+   suppress text selection so dragging highlights rows instead of characters. */
+.review-body.drag-selecting { user-select: none; -webkit-user-select: none; }
 .drow.selecting { background: rgba(88, 166, 255, 0.22); box-shadow: inset 3px 0 0 var(--blue); }
 .drow.sel-start { border-top-left-radius: var(--radius-sm); border-top-right-radius: var(--radius-sm); }
 .drow.sel-end { border-bottom-left-radius: var(--radius-sm); border-bottom-right-radius: var(--radius-sm); }
@@ -1578,7 +1581,8 @@ main {
 #review-deny { flex: 1; }
 #review-approve { flex: 1; }
 
-#review-deny:disabled {
+#review-deny:disabled,
+#review-approve:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }

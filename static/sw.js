@@ -18,6 +18,37 @@ self.addEventListener('push', (e) => {
   }));
 });
 
+// The push service (notably Chrome/FCM) can rotate or expire a subscription
+// out from under us. When it does, the browser fires this event and the old
+// endpoint stops delivering — but the server still has it and the push service
+// keeps returning 201, so failures are invisible. Re-subscribe with the same
+// VAPID key and hand the fresh subscription back so delivery resumes.
+self.addEventListener('pushsubscriptionchange', (e) => {
+  e.waitUntil((async () => {
+    try {
+      const { key } = await (await fetch('/api/push/key')).json();
+      const sub = await self.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+      await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sub.toJSON()),
+      });
+    } catch (err) {
+      // Best-effort: nothing more the worker can do if the network or auth is down.
+    }
+  })());
+});
+
+function urlBase64ToUint8Array(base64) {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64);
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+}
+
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   const url = (e.notification.data && e.notification.data.url) || '/';

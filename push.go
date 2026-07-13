@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
@@ -127,14 +129,33 @@ func (pm *PushManager) Send(p pushPayload) {
 				Urgency:         webpush.UrgencyHigh,
 			})
 			if err != nil {
-				log.Printf("push: send: %v", err)
+				log.Printf("push: send to %s: %v", endpointHost(sub.Endpoint), err)
 				return
 			}
 			defer resp.Body.Close()
-			if resp.StatusCode == 404 || resp.StatusCode == 410 {
-				log.Printf("push: subscription gone (%d); dropping", resp.StatusCode)
+			switch {
+			case resp.StatusCode == 404 || resp.StatusCode == 410:
+				log.Printf("push: %s subscription gone (%d); dropping", endpointHost(sub.Endpoint), resp.StatusCode)
 				pm.Unsubscribe(sub.Endpoint)
+			case resp.StatusCode >= 300:
+				// Non-2xx that isn't a gone-subscription: the push service
+				// rejected this send (e.g. FCM 400/403/413). It used to be
+				// swallowed silently, which made desktop push impossible to
+				// debug. Surface the status + body so the next time is diagnosable.
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+				log.Printf("push: %s rejected send (%d): %s", endpointHost(sub.Endpoint), resp.StatusCode, strings.TrimSpace(string(body)))
 			}
 		}(sub)
 	}
+}
+
+// endpointHost extracts the push service host from a subscription endpoint for
+// readable logs (endpoints carry an opaque, per-device token we keep out of logs).
+func endpointHost(endpoint string) string {
+	s := strings.TrimPrefix(endpoint, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

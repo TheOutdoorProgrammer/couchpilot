@@ -15,6 +15,9 @@ let gapState = {};       // segment index -> {up, down}: context lines revealed 
 const GAP_CHUNK = 20;    // lines revealed per expand tap
 let composerCtx = null;  // line/range target for the open comment composer; null = global
 let selection = null;    // in-flight line-range selection: {startKey, endKey, commentId}
+let dragAnchorKey = null;  // desktop drag-select: row key where the mouse went down
+let dragSelecting = false; // desktop drag-select: pointer has crossed into another row
+let suppressRowClick = false; // swallow the click event that trails a completed drag
 
 document.addEventListener('DOMContentLoaded', init);
 
@@ -1719,11 +1722,40 @@ function rangeBody(rng) {
 function updateSelectionBar() {
   const bar = document.getElementById('selection-bar');
   if (!bar) return;
-  if (!selection) { bar.hidden = true; return; }
-  bar.hidden = false;
-  document.getElementById('selection-label').textContent =
-    (selection.commentId ? 'Range · ' : '') + rangeLabel(selectionRange());
-  document.getElementById('selection-commit').textContent = selection.commentId ? 'Save' : 'Comment';
+  if (!selection) {
+    bar.hidden = true;
+  } else {
+    bar.hidden = false;
+    document.getElementById('selection-label').textContent =
+      (selection.commentId ? 'Range · ' : '') + rangeLabel(selectionRange());
+    document.getElementById('selection-commit').textContent = selection.commentId ? 'Save' : 'Comment';
+  }
+  updateReviewActionsEnabled();
+}
+
+// rowKeyAtPoint resolves the tappable diff row under a screen coordinate. Used
+// during a drag instead of per-row pointer listeners so it keeps working across
+// re-renders and when the pointer moves faster than enter/leave events fire.
+function rowKeyAtPoint(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const row = el && el.closest('.drow.tappable');
+  return row ? row.dataset.rk : null;
+}
+
+// paintDragSelection reflects the in-flight selection onto the live rows during a
+// drag by toggling classes only — no innerHTML rebuild, so no per-row re-highlight
+// and no element churn under the moving pointer. pointerup does one authoritative
+// rerenderReviewBodyPreservingScroll() to reconcile.
+function paintDragSelection() {
+  const keys = selection ? spanKeys(selection.startKey, selection.endKey) : [];
+  const inSpan = new Set(keys);
+  const startK = keys[0], endK = keys[keys.length - 1];
+  document.querySelectorAll('#review-body .drow').forEach((el) => {
+    const on = inSpan.has(el.dataset.rk);
+    el.classList.toggle('selecting', on);
+    el.classList.toggle('sel-start', on && el.dataset.rk === startK);
+    el.classList.toggle('sel-end', on && el.dataset.rk === endK);
+  });
 }
 
 function clearSelection() {
@@ -1980,10 +2012,32 @@ function renderReviewFoot() {
   const count = document.getElementById('review-comment-count');
   count.hidden = n === 0;
   count.textContent = n;
-  const deny = document.getElementById('review-deny');
-  deny.disabled = n === 0;
-  deny.title = n === 0 ? 'Add at least one comment first' : '';
   document.getElementById('review-approve').textContent = n > 0 ? 'Approve w/ comments' : 'Approve';
+  updateReviewActionsEnabled();
+}
+
+// commentInProgress is true while the reviewer is mid-comment: a line range is
+// selected (the selection bar is up) or the composer is open.
+function commentInProgress() {
+  const composer = document.getElementById('composer');
+  return !!selection || !!(composer && !composer.hidden);
+}
+
+// updateReviewActionsEnabled is the single owner of the approve/deny disabled
+// state. While mid-comment both are disabled, so a stray click meant for the
+// Comment button can't decide the review out from under an unsaved comment.
+// Otherwise approve is live and deny still needs at least one saved comment.
+function updateReviewActionsEnabled() {
+  const r = activeReview;
+  if (!r || r.status !== 'pending') return;
+  const busy = commentInProgress();
+  const n = (r.comments || []).length;
+  const approve = document.getElementById('review-approve');
+  const deny = document.getElementById('review-deny');
+  approve.disabled = busy;
+  approve.title = busy ? 'Finish or cancel your comment first' : '';
+  deny.disabled = busy || n === 0;
+  deny.title = busy ? 'Finish or cancel your comment first' : (n === 0 ? 'Add at least one comment first' : '');
 }
 
 // --- comment composer ---
@@ -2007,6 +2061,7 @@ function openComposer(ctx) {
   const text = document.getElementById('composer-text');
   text.value = editing ? ctx.text : '';
   setTimeout(() => text.focus(), 50);
+  updateReviewActionsEnabled();
 }
 
 // openComposerForEdit loads an existing comment's text into the composer. The
@@ -2027,6 +2082,7 @@ function closeComposer() {
   document.getElementById('composer').hidden = true;
   document.getElementById('composer-overlay').hidden = true;
   composerCtx = null;
+  updateReviewActionsEnabled();
 }
 
 async function saveComposerComment() {
@@ -2121,8 +2177,55 @@ function bindReviewEvents() {
     }
     const row = e.target.closest('.drow.tappable');
     if (row) {
+      if (suppressRowClick) { suppressRowClick = false; return; }
       handleRowTap(row.dataset.rk);
     }
+  });
+
+  // Desktop drag-to-select: dragging the mouse across diff rows builds a line
+  // range in one gesture. Touch is deliberately left to the tap model so native
+  // scrolling of the diff keeps working (hijacking touchmove would break it).
+  const reviewBody = document.getElementById('review-body');
+  reviewBody.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch' || e.button !== 0) return;
+    if (!activeReview || activeReview.status !== 'pending') return;
+    if (e.target.closest('[data-edit-comment],[data-del-comment],.diff-gap')) return;
+    const startRow = e.target.closest('.drow.tappable');
+    if (!startRow) return;
+
+    dragAnchorKey = startRow.dataset.rk;
+    dragSelecting = false;
+    suppressRowClick = false;
+    // A pending diff row is a click/drag comment target, not a text-selection
+    // surface — suppress text selection for the duration of the press.
+    reviewBody.classList.add('drag-selecting');
+
+    const onMove = (ev) => {
+      const k = rowKeyAtPoint(ev.clientX, ev.clientY);
+      if (!k || (!dragSelecting && k === dragAnchorKey)) return; // not past the anchor row yet
+      ev.preventDefault();
+      dragSelecting = true;
+      if (!selection || selection.startKey !== dragAnchorKey || selection.endKey !== k) {
+        selection = { startKey: dragAnchorKey, endKey: k, commentId: null };
+        paintDragSelection();
+        updateSelectionBar();
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      document.removeEventListener('pointercancel', onUp);
+      reviewBody.classList.remove('drag-selecting');
+      if (dragSelecting) {
+        suppressRowClick = true;              // the trailing click must not re-tap and collapse the range
+        rerenderReviewBodyPreservingScroll(); // reconcile the painted classes with a clean render
+      }
+      dragAnchorKey = null;
+      dragSelecting = false;
+    };
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+    document.addEventListener('pointercancel', onUp);
   });
 
   // iOS suspends background PWAs: the EventSource dies silently and its
