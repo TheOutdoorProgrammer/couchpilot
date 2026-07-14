@@ -72,6 +72,10 @@ type SessionManager struct {
 	onSessionDismissed func(id string)
 	hookPort           int
 	hookToken          string
+	// cfgSnapshot returns the current couchpilot config; wired during server
+	// setup so a spawn can read live settings (e.g. session-prompt injection).
+	// Nil in tests that construct the manager without a server.
+	cfgSnapshot func() Config
 }
 
 // SetHookEnv provides the local API coordinates the review hook needs; it
@@ -258,6 +262,14 @@ func (sm *SessionManager) spawnShim(s *Session, resume bool) error {
 	}
 	args = append(args, "--", claudePath)
 	args = append(args, buildClaudeArgs(s, resume)...)
+	// Inject the couchpilot session-prompt (appended, never replacing the default
+	// system prompt or CLAUDE.md files) when enabled for this new/resume spawn.
+	if sm.cfgSnapshot != nil {
+		cfg := sm.cfgSnapshot()
+		if pf := cfg.sessionPromptFile(resume); pf != "" {
+			args = append(args, "--append-system-prompt-file", pf)
+		}
+	}
 	args = append(args, "--settings", settingsPath)
 
 	cmd := exec.Command(self, args...)

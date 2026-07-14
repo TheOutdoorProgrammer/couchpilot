@@ -95,6 +95,7 @@ func NewServer(cfg *Config, sm *SessionManager, lm *LoginManager, hub *SSEHub, a
 	sm.onChannelsDied = func() {
 		srv.ensureChannelsSession()
 	}
+	sm.cfgSnapshot = srv.cfgSnapshot
 
 	return srv
 }
@@ -703,6 +704,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		DefaultChannels       *string  `json:"defaultChannels"`
 		PluginDirs            []string `json:"pluginDirs"`
 		ChannelsEnabled       *bool    `json:"channelsEnabled"`
+		SessionPromptPath     *string  `json:"sessionPromptPath"`
+		SessionPromptOnNew    *bool    `json:"sessionPromptOnNew"`
+		SessionPromptOnResume *bool    `json:"sessionPromptOnResume"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
 		httpError(w, err.Error(), http.StatusBadRequest)
@@ -736,6 +740,15 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if incoming.ChannelsEnabled != nil {
 			c.ChannelsEnabled = *incoming.ChannelsEnabled
+		}
+		if incoming.SessionPromptPath != nil {
+			c.SessionPromptPath = *incoming.SessionPromptPath
+		}
+		if incoming.SessionPromptOnNew != nil {
+			c.SessionPromptOnNew = *incoming.SessionPromptOnNew
+		}
+		if incoming.SessionPromptOnResume != nil {
+			c.SessionPromptOnResume = *incoming.SessionPromptOnResume
 		}
 	})
 	if err != nil {

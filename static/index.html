@@ -200,6 +200,29 @@
         </section>
 
         <section class="settings-section">
+          <h3 class="section-title">Session prompt</h3>
+          <p class="subtle" style="margin-bottom:10px;">A markdown file appended to each session's system prompt so Claude knows it's a couchpilot session. It's <em>added to</em> your global and project CLAUDE.md context, never a replacement. Edit the file to customize what every session is told.</p>
+          <div class="field">
+            <label for="session-prompt-path">Prompt file</label>
+            <input type="text" id="session-prompt-path" placeholder="~/.config/couchpilot/session-prompt.md" autocomplete="off">
+          </div>
+          <label class="toggle-field">
+            <span>Inject on new sessions</span>
+            <span class="toggle">
+              <input type="checkbox" id="session-prompt-new">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+          <label class="toggle-field" style="margin-top:10px;">
+            <span>Inject on resume</span>
+            <span class="toggle">
+              <input type="checkbox" id="session-prompt-resume">
+              <span class="toggle-track"></span>
+            </span>
+          </label>
+        </section>
+
+        <section class="settings-section">
           <h3 class="section-title">Projects</h3>
           <div class="field">
             <label>Project Roots</label>

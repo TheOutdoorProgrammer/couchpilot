@@ -87,6 +87,22 @@ func main() {
 	}
 }
 
+// defaultSessionPrompt seeds ~/.config/couchpilot/session-prompt.md on install.
+// It's appended to every couchpilot session's system prompt (see Config.SessionPrompt*),
+// so a session knows it's running under couchpilot. Users edit it freely.
+const defaultSessionPrompt = `<!-- couchpilot session prompt: appended to the system prompt of every couchpilot
+     session (toggle per new/resume in Settings). Edit freely — never overwritten. -->
+
+This is a couchpilot session — a Claude Code remote-control session launched and
+managed from couchpilot's web UI, not a local terminal.
+
+- The person driving it may be on their phone; favor concise, skimmable replies
+  over long walls of text.
+- Your output is read in a web UI and may be relayed through a messaging channel,
+  so don't rely on rich terminal formatting.
+- Confirm before long-running, expensive, or destructive actions.
+`
+
 func cmdInstall() {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -149,6 +165,20 @@ func cmdInstall() {
 	fmt.Println("couchpilot installed and started")
 	fmt.Printf("  UI: http://localhost:7080\n")
 	fmt.Printf("  Plist: %s\n", plistPath)
+
+	// Seed a default session-prompt file so new installs get the behavior, but
+	// never clobber a customized one.
+	if cfg, err := LoadConfig(); err == nil && cfg.SessionPromptPath != "" {
+		promptPath := expandPath(cfg.SessionPromptPath)
+		if _, statErr := os.Stat(promptPath); os.IsNotExist(statErr) {
+			os.MkdirAll(filepath.Dir(promptPath), 0755)
+			if werr := os.WriteFile(promptPath, []byte(defaultSessionPrompt), 0644); werr == nil {
+				fmt.Printf("  Session prompt: %s (created — edit it to change what every couchpilot session is told)\n", promptPath)
+			}
+		} else {
+			fmt.Printf("  Session prompt: %s (edit to customize what every couchpilot session is told)\n", promptPath)
+		}
+	}
 }
 
 func cmdUninstall() {

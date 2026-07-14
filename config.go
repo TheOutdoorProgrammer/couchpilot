@@ -21,6 +21,14 @@ type Config struct {
 	ChannelsEnabled       bool     `json:"channelsEnabled"`
 	AuthEnabled           bool     `json:"authEnabled"`
 
+	// SessionPrompt* inject a context file into every spawned session via
+	// `claude --append-system-prompt-file`, so sessions know they run under
+	// couchpilot. Read live at spawn time and gated per new/resume, so toggling
+	// takes effect on the next spawn without a respawn.
+	SessionPromptPath     string `json:"sessionPromptPath"`
+	SessionPromptOnNew    bool   `json:"sessionPromptOnNew"`
+	SessionPromptOnResume bool   `json:"sessionPromptOnResume"`
+
 	configPath string
 }
 
@@ -40,6 +48,9 @@ func LoadConfig() (*Config, error) {
 		FavoriteDirs:          []string{"~/"},
 		DefaultPermissionMode: "bypassPermissions",
 		AuthEnabled:           true,
+		SessionPromptPath:     "~/.config/couchpilot/session-prompt.md",
+		SessionPromptOnNew:    true,
+		SessionPromptOnResume: true,
 		configPath:            configPath,
 	}
 
@@ -60,6 +71,9 @@ func LoadConfig() (*Config, error) {
 			FavoriteDirs:          []string{"~/"},
 			DefaultPermissionMode: "bypassPermissions",
 			AuthEnabled:           true,
+			SessionPromptPath:     "~/.config/couchpilot/session-prompt.md",
+			SessionPromptOnNew:    true,
+			SessionPromptOnResume: true,
 		}
 	}
 	cfg.configPath = configPath
@@ -77,4 +91,22 @@ func (c *Config) Save() error {
 
 func (c *Config) DataDir() string {
 	return filepath.Dir(c.configPath)
+}
+
+// sessionPromptFile returns the expanded path of the session prompt to inject on
+// this spawn, or "" if injection is off for the new/resume case, the path is
+// unset, or the file is missing/empty — so a bad or absent path never breaks a
+// spawn (the flag is simply omitted).
+func (c *Config) sessionPromptFile(resume bool) string {
+	if (resume && !c.SessionPromptOnResume) || (!resume && !c.SessionPromptOnNew) {
+		return ""
+	}
+	if c.SessionPromptPath == "" {
+		return ""
+	}
+	p := expandPath(c.SessionPromptPath)
+	if info, err := os.Stat(p); err != nil || info.IsDir() || info.Size() == 0 {
+		return ""
+	}
+	return p
 }

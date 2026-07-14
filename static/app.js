@@ -828,6 +828,9 @@ function openSettings() {
   updatePermWarn();
   setModelFromValue('default-model', config.defaultModel || '');
   document.getElementById('default-effort').value = config.defaultEffort || '';
+  document.getElementById('session-prompt-path').value = config.sessionPromptPath || '';
+  document.getElementById('session-prompt-new').checked = config.sessionPromptOnNew !== false;
+  document.getElementById('session-prompt-resume').checked = config.sessionPromptOnResume !== false;
   document.getElementById('channels-enabled').checked = !!config.channelsEnabled;
   document.getElementById('channels-config').style.display = config.channelsEnabled ? '' : 'none';
   document.getElementById('default-channels').value = config.defaultChannels || '';
@@ -1089,6 +1092,9 @@ function bindEvents() {
         defaultPermissionMode: document.getElementById('default-perm-mode').value,
         defaultModel: getModelValue('default-model'),
         defaultEffort: document.getElementById('default-effort').value,
+        sessionPromptPath: document.getElementById('session-prompt-path').value.trim(),
+        sessionPromptOnNew: document.getElementById('session-prompt-new').checked,
+        sessionPromptOnResume: document.getElementById('session-prompt-resume').checked,
         channelsEnabled: document.getElementById('channels-enabled').checked,
         defaultChannels: document.getElementById('default-channels').value.trim(),
         pluginDirs: settingsDraft.pluginDirs,
